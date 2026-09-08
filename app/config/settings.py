@@ -69,7 +69,9 @@ class Settings(BaseSettings):
     EMBED_BATCH_SIZE: int = 10               # 向量化单批上限（百炼限制）
 
     # ---- 会话与查询约束 ----
-    HISTORY_MAX_TURNS: int = 5     # 上下文保留最近轮数（精简 token）
+    # 上下文保留最近"轮数"（1 轮 = 1 user + 1 assistant = 2 条消息）；
+    # build_history / get_history 内部会按 turns*2 取条数，保证完整轮次
+    HISTORY_MAX_TURNS: int = 8
     QUERY_MAX_ROUNDS: int = 5      # 人工在环查询轮次上限
     PASTE_MAX_LINES: int = 30      # 回传结果粘贴行数上限
 

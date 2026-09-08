@@ -131,13 +131,17 @@ def add_message(db: Session, session_id: str, role: str, content: str) -> None:
 
 def get_history(db: Session, session_id: str, limit_turns: int = 8) -> list[dict[str, str]]:
     """
-    读取最近 limit_turns 条消息（时间正序），供上下文裁剪。
+    读取最近 limit_turns "轮"消息（1 轮 = user + assistant = 2 条），时间正序。
+    limit_turns 是轮数，内部按 turns*2 取条数，保证完整轮次，避免半轮丢上文。
     返回 [{"role":..., "content":...}, ...]
     """
+    msg_limit = max(limit_turns * 2, 2)  # 至少 2 条（1 轮）
     rows = db.query(Message).filter(
         Message.conversation_id == session_id
-    ).order_by(Message.id.desc()).limit(limit_turns).all()
-    return [{"role": r.role, "content": r.content} for r in reversed(rows)]
+    ).order_by(Message.id.desc()).limit(msg_limit).all()
+    msgs = [{"role": r.role, "content": r.content} for r in reversed(rows)]
+    # 若最新一条是 user（未配对 assistant），保留它——指代消解需要上一轮 user+assistant
+    return msgs
 
 
 def _conv_to_dict(c: Conversation) -> dict[str, Any]:

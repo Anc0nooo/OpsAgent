@@ -49,8 +49,10 @@ def build_history(db: Session, session_id: str, limit: int | None = None) -> str
     lines = []
     for m in msgs:
         tag = "用户" if m["role"] == "user" else "助手"
-        # 单条过长截断，防止上下文爆炸
-        content = m["content"][:400] + ("…（截断）" if len(m["content"]) > 400 else "")
+        # 助手回答常含表字段列表，截断会丢关键上文；放长到 800
+        # 用户问题通常较短，保留 400 已足够
+        cap = 800 if m["role"] == "assistant" else 400
+        content = m["content"][:cap] + ("…（截断）" if len(m["content"]) > cap else "")
         lines.append(f"{tag}: {content}")
     return "\n".join(lines)
 
