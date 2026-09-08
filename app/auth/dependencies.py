@@ -1,9 +1,8 @@
 """
-FastAPI 认证依赖：get_current_user
+FastAPI 认证依赖：get_current_user / require_admin
 
-从请求头 Authorization: Bearer <token> 解析 JWT，
-查询 users 表返回当前用户对象。
-所有业务接口注入此依赖实现鉴权。
+- get_current_user：从请求头 Authorization: Bearer <token> 解析 JWT，返回当前用户
+- require_admin：在 get_current_user 基础上校验 role == 'ancon'，非管理员返回 403
 """
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -52,4 +51,14 @@ def get_current_user(
     if user.status != 1:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已被禁用")
 
+    return user
+
+
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    """管理员鉴权：role == 'ancon' 才允许访问，否则 403"""
+    if user.role != "ancon":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无管理员权限",
+        )
     return user

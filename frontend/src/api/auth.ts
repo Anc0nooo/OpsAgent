@@ -12,6 +12,8 @@ export interface UserInfo {
   user_id: number
   username: string
   status: number
+  /** 角色：ancon=管理员 / user=普通用户 */
+  role: string
   /** 头像 data URL；空串 = 未上传（前端用用户名首字符兜底） */
   avatar: string
 }
@@ -19,11 +21,11 @@ export interface UserInfo {
 /** 登录：成功后自动保存 token */
 export async function login(username: string, password: string): Promise<UserInfo> {
   const resp = await request.post('/auth/login', { username, password })
-  const data = resp.data?.data as { token: string; user_id: number; username: string }
+  const data = resp.data?.data as { token: string; user_id: number; username: string; role: string }
   setToken(data.token)
-  // 拉取完整信息（含头像）
+  // 拉取完整信息（含头像 + role）
   const me = await fetchMe()
-  return me ?? { user_id: data.user_id, username: data.username, status: 1, avatar: '' }
+  return me ?? { user_id: data.user_id, username: data.username, status: 1, role: data.role, avatar: '' }
 }
 
 /** 注册 */

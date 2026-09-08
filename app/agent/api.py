@@ -8,13 +8,14 @@ Agent 规划器 - 临时 API（阶段 2 提供非流式内部调用链，供状�
 - GET  /api/agent/sessions/{id}       会话详情（含消息历史）
 - DELETE /api/agent/sessions/{id}     删除会话
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.agent import store
 from app.agent.planner import planner
 from app.auth.dependencies import get_current_user
+from app.auth.log import log_operation
 from app.db.engine import get_db
 from app.db.models import User
 from app.models.common import ok
@@ -39,9 +40,11 @@ class BatchDeleteIn(BaseModel):
 
 
 @router.post("/chat")
-def chat(body: ChatIn, db: Session = Depends(get_db),
+def chat(body: ChatIn, request: Request, db: Session = Depends(get_db),
          user: User = Depends(get_current_user)) -> dict:
     """发送一条消息（非流式），返回助手回复与状态机状态"""
+    log_operation(db, user.id, "chat", f"Agent消息: {body.text[:80]}",
+                  request, username=user.username)
     reply = planner.handle_message(db, user, body.session_id, body.text)
     return ok(reply)
 

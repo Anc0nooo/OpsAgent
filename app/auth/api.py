@@ -1,20 +1,22 @@
 """
 认证 API 路由
-- POST /api/auth/register：注册（username + password）
-- POST /api/auth/login：登录（返回 JWT token）
-- GET  /api/auth/me：当前用户信息（需鉴权，含头像）
+- POST /api/auth/register：注册（username + password；首个用户或匹配 ADMIN_USERNAME 自动成为 ancon）
+- POST /api/auth/login：登录（返回 JWT token + role）
+- GET  /api/auth/me：当前用户信息（需鉴权，含头像 + role）
 - POST /api/auth/avatar：上传头像（需鉴权，存 base64 data URL）
 - DELETE /api/auth/avatar：移除头像（恢复默认用户名首字符）
 """
 import base64
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
 from app.auth.jwt import create_token
+from app.auth.log import log_operation
 from app.auth.password import hash_password, verify_password
+from app.config.settings import settings
 from app.db.engine import get_db
 from app.db.models import User, UserConfig
 
@@ -39,16 +41,24 @@ class LoginIn(BaseModel):
 
 
 @router.post("/register")
-def register(body: RegisterIn, db: Session = Depends(get_db)) -> dict:
+def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)) -> dict:
     """注册新用户：用户名不重复，密码 bcrypt 哈希后存库"""
     # 校验用户名不重复
     existing = db.query(User).filter(User.username == body.username).first()
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
 
+    # 角色判定：库为空（首个用户）或用户名匹配 ADMIN_USERNAME → ancon，否则 user
+    user_count = db.query(User).count()
+    is_admin = user_count == 0 or (
+        settings.ADMIN_USERNAME and body.username == settings.ADMIN_USERNAME
+    )
+    role = "ancon" if is_admin else "user"
+
     user = User(
-        username=body.username,
+        username= body.username,
         password_hash=hash_password(body.password),
+        role=role,
     )
     db.add(user)
     db.flush()  # 拿到 user.id
@@ -59,23 +69,36 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> dict:
     db.commit()
     db.refresh(user)
 
-    return {"code": 0, "message": "注册成功", "data": {"user_id": user.id, "username": user.username}}
+    # 日志：注册（user_id=新用户自己）
+    log_operation(db, user.id, "register", f"注册用户 {body.username}（角色: {role}）",
+                 request, username=user.username)
+
+    return {"code": 0, "message": "注册成功",
+            "data": {"user_id": user.id, "username": user.username, "role": role}}
 
 
 @router.post("/login")
-def login(body: LoginIn, db: Session = Depends(get_db)) -> dict:
-    """登录：校验密码，返回 JWT token"""
+def login(body: LoginIn, request: Request, db: Session = Depends(get_db)) -> dict:
+    """登录：校验密码，返回 JWT token（含 role）"""
     user = db.query(User).filter(User.username == body.username).first()
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     if user.status != 1:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="账号已被禁用")
 
-    token = create_token(user.id, user.username)
+    token = create_token(user.id, user.username, user.role)
+    # 日志：登录（含 IP）
+    log_operation(db, user.id, "login", f"用户 {user.username} 登录",
+                 request, username=user.username)
     return {
         "code": 0,
         "message": "登录成功",
-        "data": {"token": token, "user_id": user.id, "username": user.username},
+        "data": {
+            "token": token,
+            "user_id": user.id,
+            "username": user.username,
+            "role": user.role,
+        },
     }
 
 
@@ -89,6 +112,7 @@ def me(user: User = Depends(get_current_user)) -> dict:
             "user_id": user.id,
             "username": user.username,
             "status": user.status,
+            "role": user.role,
             "avatar": user.avatar or "",
         },
     }

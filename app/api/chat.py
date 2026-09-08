@@ -12,7 +12,7 @@ SSE 事件格式（data: JSON\n\n）：
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.agent import store
 from app.agent.planner import planner
 from app.auth.dependencies import get_current_user
+from app.auth.log import log_operation
 from app.db.engine import get_db
 from app.db.models import User
 from app.models.common import ok
@@ -34,16 +35,20 @@ class ChatIn(BaseModel):
 
 
 @router.post("/chat")
-def chat(body: ChatIn, db: Session = Depends(get_db),
+def chat(body: ChatIn, request: Request, db: Session = Depends(get_db),
          user: User = Depends(get_current_user)) -> dict:
     """非流式对话（一次性返回完整结果）"""
+    log_operation(db, user.id, "chat", f"消息: {body.text[:80]}",
+                  request, username=user.username)
     return ok(planner.handle_message(db, user, body.session_id, body.text))
 
 
 @router.post("/stream")
-async def chat_stream(body: ChatIn, db: Session = Depends(get_db),
+async def chat_stream(body: ChatIn, request: Request, db: Session = Depends(get_db),
                      user: User = Depends(get_current_user)) -> StreamingResponse:
     """SSE 流式对话：逐事件推送处理状态与正文增量"""
+    log_operation(db, user.id, "chat", f"流式消息: {body.text[:80]}",
+                  request, username=user.username)
 
     async def event_source():
         try:

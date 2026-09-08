@@ -12,7 +12,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { listSessions, pinSession, batchDeleteSessions, type SessionItem } from '../api/chat'
 import { removeAvatar, uploadAvatar } from '../api/auth'
-import { avatar, avatarColor, avatarInitial, doLogout, loadUser, username } from '../store/user'
+import { avatar, avatarColor, avatarInitial, doLogout, loadUser, role, username } from '../store/user'
 import { refreshSettingsStatus, settingsStatus } from '../store/settings'
 import { fileToAvatarDataUrl } from '../utils/avatar'
 import { confirmDanger } from '../utils/dialog'
@@ -266,6 +266,12 @@ async function onLogout() {
   router.push('/login')
 }
 
+/** 菜单：管理后台 */
+function goAdmin() {
+  closeUserMenu()
+  router.push('/admin')
+}
+
 onMounted(async () => {
   // 登录态下拉取当前用户（头像/用户名）与配置状态；401 由拦截器统一处理
   loadUser()
@@ -329,6 +335,21 @@ defineExpose({ refreshSessions })
         </svg>
       </button>
     </div>
+
+    <!-- 管理员入口（仅 role == 'ancon' 可见） -->
+    <button
+      v-if="role === 'ancon'"
+      class="nav-btn admin-nav"
+      :class="{ collapsed: props.collapsed }"
+      :title="props.collapsed ? '管理后台' : ''"
+      @click="router.push('/admin')"
+    >
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+        <polyline points="9 22 9 12 15 12 15 22"/>
+      </svg>
+      <span v-if="!props.collapsed">管理后台</span>
+    </button>
 
     <!-- 历史会话列表 -->
     <div v-if="!props.collapsed" class="session-list">
@@ -471,9 +492,11 @@ defineExpose({ refreshSessions })
         </svg>
       </button>
 
-      <!-- 用户菜单（头像上传 / 移除 / 退出登录） -->
+      <!-- 用户菜单（管理后台 / 头像上传 / 移除 / 退出登录） -->
       <div v-if="showUserMenu" class="menu-backdrop" @click="closeUserMenu"></div>
       <div v-if="showUserMenu" class="user-menu">
+        <button v-if="role === 'ancon'" class="menu-item" @click="goAdmin">管理后台</button>
+        <div v-if="role === 'ancon'" class="menu-divider"></div>
         <button class="menu-item" @click="triggerAvatarUpload">
           {{ avatar ? '更换头像' : '上传头像' }}
         </button>
@@ -832,6 +855,38 @@ defineExpose({ refreshSessions })
 .batch-btn.danger:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* 管理员导航按钮 */
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 16px);
+  margin: 4px 8px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 13px;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.15s;
+}
+.nav-btn:hover {
+  background: var(--hover-bg, #ececec);
+}
+.nav-btn.collapsed {
+  justify-content: center;
+  width: 36px;
+  margin: 4px auto;
+}
+.admin-nav {
+  color: #e8533f;
+}
+.admin-nav:hover {
+  background: rgba(232, 83, 63, 0.08);
 }
 
 /* 底部 */

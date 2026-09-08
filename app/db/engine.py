@@ -60,6 +60,17 @@ def _migrate_schema() -> None:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE users ADD COLUMN avatar MEDIUMTEXT NULL"))
             logger.info("users 表已补充 avatar 列")
+        if "role" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'"))
+            logger.info("users 表已补充 role 列")
+
+    # 迁移后：如果没有 ancon 角色，把第一个用户（最小 ID）设为 ancon
+    with engine.begin() as conn:
+        result = conn.execute(text("SELECT COUNT(*) FROM users WHERE role = 'ancon'")).scalar()
+        if result == 0:
+            conn.execute(text("UPDATE users SET role = 'ancon' WHERE id = (SELECT id FROM (SELECT id FROM users ORDER BY id LIMIT 1) t)"))
+            logger.info("已将第一个用户设为管理员（ancon）")
 
 
 def init_db() -> None:

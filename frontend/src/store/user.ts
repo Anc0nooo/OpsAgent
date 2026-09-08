@@ -9,6 +9,7 @@ import { getToken } from '../api/token'
 
 export const username = ref('')
 export const avatar = ref('') // data URL；空 = 用首字符兜底
+export const role = ref('user') // ancon=管理员 / user=普通用户
 
 /** 已登录（有 token 且已拉到用户名） */
 export const isLoggedIn = ref(false)
@@ -24,6 +25,7 @@ export async function loadUser(): Promise<UserInfo | null> {
     if (me) {
       username.value = me.username
       avatar.value = me.avatar || ''
+      role.value = me.role || 'user'
       isLoggedIn.value = true
       return me
     }
@@ -43,7 +45,13 @@ export function doLogout(): void {
 function resetUser(): void {
   username.value = ''
   avatar.value = ''
+  role.value = 'user'
   isLoggedIn.value = false
+}
+
+/** 是否管理员 */
+export function isAdmin(): boolean {
+  return role.value === 'ancon'
 }
 
 /** 头像兜底：用户名首字符（中文原样，英文大写） */

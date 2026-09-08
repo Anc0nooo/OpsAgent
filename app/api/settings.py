@@ -13,12 +13,13 @@
 """
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.auth.log import log_operation
 from app.config.settings import settings
 from app.core.llm import invalidate_user_llm
 from app.db.engine import get_db
@@ -109,7 +110,7 @@ def get_status(db: Session = Depends(get_db),
 
 
 @router.post("/keys")
-def save_config(body: ConfigIn, db: Session = Depends(get_db),
+def save_config(body: ConfigIn, request: Request, db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)) -> dict:
     """保存当前用户配置到 user_configs（upsert；空字段不覆盖）"""
     cfg = _get_user_config(db, user.id)
@@ -127,6 +128,8 @@ def save_config(body: ConfigIn, db: Session = Depends(get_db),
 
     # 清除当前用户 LLM 客户端缓存，下次请求按新配置重建
     invalidate_user_llm(user.id)
+    log_operation(db, user.id, "config_save", "保存模型配置",
+                  request, username=user.username)
     logger.info("用户 %s 配置已保存并清除客户端缓存", user.id)
     return ok({"message": f"配置已生效，当前使用阿里百炼 {cfg.chat_model or settings.CHAT_MODEL} 模型"})
 

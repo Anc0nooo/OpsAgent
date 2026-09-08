@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.agent import store as agent_store
 from app.agent.api import router as agent_router
+from app.admin.api import router as admin_router
 from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.api.settings import router as settings_router
@@ -53,6 +54,7 @@ app.include_router(knowledge_router)
 app.include_router(agent_router)
 app.include_router(chat_router)
 app.include_router(output_router)
+app.include_router(admin_router)
 
 
 # 全局异常兜底：统一返回 {code, message, data}

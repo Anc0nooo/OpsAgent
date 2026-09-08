@@ -1,0 +1,36 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 环境与密钥（绝不提交）=====
+.env
+.env.*
+!.env.example
+
+# ===== 数据目录（Chroma 向量库 / 上传文件，只在服务器）=====
+data/
+
+# ===== 前端 =====
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# ===== 打包文件 =====
+*.tar.gz
+*.zip
+*.rar
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# ===== 日志 =====
+*.log
+nohup.out

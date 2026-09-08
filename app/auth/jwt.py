@@ -7,11 +7,12 @@ import jwt as pyjwt
 from app.config.settings import settings
 
 
-def create_token(user_id: int, username: str) -> str:
-    """生成 JWT token（含 user_id + username，有效期 JWT_EXPIRE_DAYS 天）"""
+def create_token(user_id: int, username: str, role: str = "user") -> str:
+    """生成 JWT token（含 user_id + username + role，有效期 JWT_EXPIRE_DAYS 天）"""
     payload: dict[str, Any] = {
         "user_id": user_id,
         "username": username,
+        "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(days=settings.JWT_EXPIRE_DAYS),
         "iat": datetime.now(timezone.utc),
     }

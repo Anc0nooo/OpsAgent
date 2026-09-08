@@ -7,12 +7,12 @@ openai>=1.30.0
 httpx>=0.27.0
 python-dotenv>=1.0.0
 langchain-text-splitters>=0.2.0
-chromadb==1.5.9        # 锁定版本：0.x 与 1.x 存储布局不同，混用会导致 HNSW 索引损坏
+chromadb==1.5.9
 pymupdf>=1.24.0        # PDF parser
 python-docx>=1.1.0     # DOCX parser
 python-multipart>=0.0.9  # multipart form parsing
 sqlalchemy>=2.0.0
 pymysql>=1.1.0
-cryptography>=42.0.0   # PyMySQL caching_sha2_password 支持
+cryptography>=42.0.0   # PyMySQL caching_sha2_password
 bcrypt>=4.1.0
 pyjwt>=2.8.0

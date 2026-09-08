@@ -3,10 +3,11 @@ chcp 65001 >nul
 title OpsAgent 本地启动
 
 REM ============================================================
-REM OpsAgent 本地一键启动脚本
+REM OpsAgent 本地一键启动脚本（多用户架构：MySQL + JWT + 管理员）
 REM 用法：双击运行，或命令行执行 run_local.bat
-REM 前提：1) 已安装 Python 3.11+ 与 Node.js 18+
-REM       2) 已复制 .env.example 为 .env 并填入 DASHSCOPE_API_KEY
+REM 前提：1) 已安装 Python 3.11+ 与 Node.js 18+ 与 MySQL 8.0
+REM       2) 已编辑 .env 填入 MYSQL_PASSWORD 和 JWT_SECRET
+REM       3) 已运行 python scripts\init_mysql.py 创建 opsagent 数据库
 REM ============================================================
 
 echo [1/3] 检查后端虚拟环境...

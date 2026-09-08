@@ -155,6 +155,11 @@ onBeforeUnmount(() => {
     <RouterView />
   </div>
 
+  <!-- 管理后台：独立全屏布局（无侧边栏，仅管理员可访问） -->
+  <div v-else-if="route.path === '/admin'" class="admin-shell">
+    <RouterView />
+  </div>
+
   <div v-else class="app-layout">
     <!-- 移动端遮罩 -->
     <div
@@ -235,6 +240,13 @@ onBeforeUnmount(() => {
 .login-shell {
   height: 100vh;
   overflow: hidden;
+}
+
+/* 管理后台独立布局外壳 */
+.admin-shell {
+  height: 100vh;
+  overflow: auto;
+  background: #f5f5f7;
 }
 
 .app-layout {

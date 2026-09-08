@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_DAYS: int = 7
 
+    # ---- 管理员 ----
+    ADMIN_USERNAME: str = ""  # 启动时将该用户自动设为 ancon；留空则首个注册用户为 ancon
+
     # ---- 阿里百炼（全局默认；用户未单独配置时兜底）----
     DASHSCOPE_API_KEY: str = ""
     DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"

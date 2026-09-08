@@ -12,12 +12,13 @@ RAG 知识库 - API 路由（多用户：所有接口需登录，按 user_id 隔
 import logging
 
 import chromadb
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 import pymupdf  # PyMuPDF
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.auth.log import log_operation
 from app.db.engine import get_db
 from app.db.models import User
 from app.models.common import fail, ok
@@ -95,6 +96,7 @@ def read_docx_text(data: bytes) -> str:
 # ----------------------------------------------------------------------
 @router.post("/upload")
 async def upload_doc(
+    request: Request,
     file: UploadFile = File(...),
     doc_type: str = Form("guide"),
     title: str = Form(""),
@@ -126,6 +128,9 @@ async def upload_doc(
             append=append_doc_id is not None,
         )
         db.commit()
+        log_operation(db, user.id, "upload_doc",
+                      f"上传文档《{title or file.filename}》(id={doc_id})",
+                      request, username=user.username)
         return ok({"doc_id": doc_id, "message": "入库成功"})
     except chromadb.errors.InternalError:
         # Chroma HNSW 索引损坏：本次写入已回滚，自动修复后提示重新上传
@@ -242,13 +247,15 @@ def get_docs(db: Session = Depends(get_db),
 
 
 @router.delete("/docs/{doc_id}")
-def remove_doc(doc_id: int, db: Session = Depends(get_db),
+def remove_doc(doc_id: int, request: Request, db: Session = Depends(get_db),
                user: User = Depends(get_current_user)) -> dict:
     """删除文档（同步清理向量与索引；校验归属）"""
     deleted = knowledge_service.delete_document(db, user.id, doc_id)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"文档不存在或无权访问: {doc_id}")
     db.commit()
+    log_operation(db, user.id, "delete_doc", f"删除文档 id={doc_id}",
+                  request, username=user.username)
     return ok({"message": "删除成功"})
 
 
@@ -313,12 +320,15 @@ def change_doc_type(doc_id: int, body: DocTypeIn, db: Session = Depends(get_db),
 
 
 @router.post("/search")
-def search(body: SearchIn, db: Session = Depends(get_db),
+def search(body: SearchIn, request: Request, db: Session = Depends(get_db),
            user: User = Depends(get_current_user)) -> dict:
     """混合检索：BM25 + 向量 + gte-rerank，返回 top_k（默认5）"""
     try:
         results = knowledge_service.retrieve(db, user.id, body.query,
                                              doc_type=body.doc_type, top_k=body.top_k)
+        log_operation(db, user.id, "retrieve",
+                      f"检索「{body.query[:50]}」→ {len(results)} 条",
+                      request, username=user.username)
         return ok(results)
     except Exception as e:  # noqa: BLE001
         logger.exception("检索失败")

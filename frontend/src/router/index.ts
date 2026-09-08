@@ -3,10 +3,12 @@
  * - /login 登录/注册页（公开）
  * - / 对话页（历史会话已移入左侧边栏，不再单独路由）
  * - /knowledge 知识库管理页
- * 路由守卫：无 token 访问业务页 → 跳 /login；有 token 访问 /login → 跳首页
+ * - /admin 管理后台（仅 role == 'ancon' 可访问）
+ * 路由守卫：无 token → 跳 /login；非管理员访问 /admin → 跳首页
  */
 import { createRouter, createWebHistory } from 'vue-router'
 import { getToken } from '../api/token'
+import { role } from '../store/user'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -29,10 +31,16 @@ const router = createRouter({
       component: () => import('../views/KnowledgeView.vue'),
       meta: { title: '知识库管理' },
     },
+    {
+      path: '/admin',
+      name: 'admin',
+      component: () => import('../views/AdminView.vue'),
+      meta: { title: '管理后台', requiresAdmin: true },
+    },
   ],
 })
 
-// 全局前置守卫：登录态校验
+// 全局前置守卫：登录态 + 管理员角色校验
 router.beforeEach((to) => {
   const token = getToken()
   if (!to.meta.public && !token) {
@@ -41,6 +49,10 @@ router.beforeEach((to) => {
   }
   if (to.path === '/login' && token) {
     // 已登录访问登录页 → 跳首页
+    return { path: '/' }
+  }
+  // 管理员页面：非 ancon 角色 → 跳首页
+  if (to.meta.requiresAdmin && role.value !== 'ancon') {
     return { path: '/' }
   }
 })
