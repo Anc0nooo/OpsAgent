@@ -1047,19 +1047,15 @@ defineExpose({ refreshSessions })
   display: none;
 }
 
-/* 移动端响应式：< 768px 变抽屉 */
+/* 移动端响应式：< 768px 侧边栏由 App.vue 的 van-popup 抽屉承载，
+   这里只需填满抽屉容器（定位 / 遮罩 / 滑入动画全部交给 Vant） */
 @media (max-width: 768px) {
-  .sidebar {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    z-index: 100;
-    box-shadow: 2px 0 12px rgba(0, 0, 0, 0.15);
-  }
+  .sidebar,
   .sidebar.collapsed {
-    transform: translateX(-100%);
-    width: 280px;
+    width: 100%;
+    height: 100%;
+    border-right: none;
+    box-shadow: none;
   }
 }
 </style>

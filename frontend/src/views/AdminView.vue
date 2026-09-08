@@ -19,6 +19,7 @@
           />
           <el-button @click="loadUsers(1)">搜索</el-button>
         </div>
+        <div class="table-scroll">
         <el-table :data="users" v-loading="userLoading" stripe style="width: 100%">
           <el-table-column prop="id" label="ID" width="60" />
           <el-table-column prop="username" label="用户名" min-width="120" />
@@ -63,6 +64,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </div>
         <el-pagination
           v-model:current-page="userPage"
           :page-size="userPageSize"
@@ -97,6 +99,7 @@
           <el-button @click="loadLogs(1)">查询</el-button>
           <el-button @click="handleExport" :loading="exporting">导出 CSV</el-button>
         </div>
+        <div class="table-scroll">
         <el-table :data="logs" v-loading="logLoading" stripe style="width: 100%">
           <el-table-column prop="created_at" label="时间" width="160" />
           <el-table-column prop="username" label="用户" min-width="100" />
@@ -108,6 +111,7 @@
           <el-table-column prop="detail" label="详情" min-width="250" show-overflow-tooltip />
           <el-table-column prop="ip" label="IP" width="120" />
         </el-table>
+        </div>
         <el-pagination
           v-model:current-page="logPage"
           :page-size="logPageSize"
@@ -168,12 +172,13 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
 import {
   deleteUser, exportLogs, listLogs, listUsers, resetPassword,
   updateRole, updateStatus, type AdminUserItem, type LogItem,
 } from '../api/admin'
+import { confirmDanger } from '../utils/dialog'
 
 const activeTab = ref('users')
 
@@ -251,17 +256,17 @@ async function submitReset() {
 }
 
 async function confirmDelete(row: AdminUserItem) {
+  const ok = await confirmDanger(
+    `确定删除用户「${row.username}」吗？将级联删除其配置、会话、消息、知识文档和全部向量数据，此操作不可恢复。`,
+    '危险操作',
+  )
+  if (!ok) return
   try {
-    await ElMessageBox.confirm(
-      `确定删除用户「${row.username}」吗？\n将级联删除其配置、会话、消息、知识文档和全部向量数据，此操作不可恢复。`,
-      '危险操作',
-      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' },
-    )
     await deleteUser(row.id)
     ElMessage.success('用户已删除')
     await loadUsers()
   } catch (e: any) {
-    if (e !== 'cancel' && e?.message) ElMessage.error(e.message)
+    ElMessage.error(e.message || '操作失败')
   }
 }
 
@@ -373,5 +378,36 @@ onMounted(async () => {
 :deep(.danger-item:hover) {
   color: var(--el-color-danger);
   background: var(--el-color-danger-light-9);
+}
+
+/* 表格横向滚动容器：列总宽超出屏幕时出现横向滚动条，不挤压列宽 */
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 移动端适配（<768px）：页面留边收紧、表格保留最小宽度后横滚 */
+@media (max-width: 768px) {
+  .admin-page {
+    padding: 12px;
+  }
+  .admin-header h2 {
+    font-size: 17px;
+  }
+  /* 表格内部列保持可读最小宽度，超宽由 .table-scroll 横滚 */
+  .table-scroll :deep(.el-table) {
+    min-width: 640px;
+  }
+  .toolbar {
+    gap: 6px;
+  }
+  .toolbar .el-input {
+    width: 100% !important;
+  }
+  /* 分页按钮触控热区 */
+  .toolbar :deep(.el-button) {
+    min-height: 40px;
+  }
 }
 </style>

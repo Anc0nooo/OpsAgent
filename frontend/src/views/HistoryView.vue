@@ -169,4 +169,22 @@ onMounted(refresh)
   color: var(--text-sub);
   font-size: 13.5px;
 }
+
+/* 移动端（<768px）：收紧留白、列表项触控尺寸 */
+@media (max-width: 768px) {
+  .page-inner {
+    padding: 14px 12px calc(24px + env(safe-area-inset-bottom, 0px));
+  }
+  .page-title {
+    font-size: 17px;
+  }
+  .session-item {
+    padding: 12px;
+    min-height: 56px;
+  }
+  .btn {
+    padding: 8px 12px;
+    min-height: 40px;
+  }
+}
 </style>

@@ -1195,4 +1195,114 @@ watch(() => messages.value.length, scrollToBottom)
   justify-content: center;
   gap: 12px;
 }
+
+/* ============================================================
+   移动端适配（< 768px）
+   说明：页面高度由 App.vue 的 .app-layout 使用 --app-height
+   （visualViewport 实时高度），软键盘弹出时整体布局收缩，
+   输入框自然停在键盘上方，无需额外 JS 定位。
+   ============================================================ */
+@media (max-width: 768px) {
+  /* 消息滚动： iOS 顺滑滚动 */
+  .msg-scroll {
+    -webkit-overflow-scrolling: touch;
+  }
+  .msg-list {
+    padding: 14px 12px 0;
+  }
+  .row {
+    margin-bottom: 22px;
+  }
+  /* 用户气泡：宽屏 max 80% → 移动 85%，贴合手机阅读 */
+  .user-bubble {
+    max-width: 85%;
+    padding: 9px 13px;
+    font-size: 15px;
+  }
+  .ai-content {
+    font-size: 15px;
+    line-height: 1.7;
+  }
+
+  /* markdown：代码块 / 表格在小屏横向滚动，不撑破屏幕 */
+  .md-body :deep(pre) {
+    max-width: 100%;
+    -webkit-overflow-scrolling: touch;
+    font-size: 13px;
+  }
+  .md-body :deep(table) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .md-body :deep(img) {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* 空状态欢迎区 */
+  .hero {
+    padding: 0 18px;
+  }
+  .hero-title {
+    font-size: 22px;
+  }
+  .quick-list {
+    gap: 8px;
+  }
+  .quick-chip {
+    font-size: 13.5px;
+    padding: 9px 14px;
+  }
+
+  /* 底部输入区：贴底 + 刘海屏安全区 */
+  .input-area {
+    padding: 6px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+  .input-box {
+    border-radius: 14px;
+    padding: 10px 12px 8px;
+  }
+  .input-textarea {
+    font-size: 16px; /* 16px 防止 iOS 聚焦时自动放大页面 */
+    min-height: 40px;
+  }
+  /* 发送按钮：44px 触控热区 */
+  .send-btn {
+    width: 44px;
+    height: 44px;
+  }
+  /* 状态小字移动端隐藏，省纵向空间 */
+  .status-line {
+    display: none;
+  }
+
+  /* 挂起 SQL 提示卡：纵向堆叠、紧凑显示 */
+  .pending-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 10px 12px;
+    font-size: 12.5px;
+  }
+  .pending-info {
+    white-space: normal;
+    line-height: 1.5;
+  }
+  .pending-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .pending-btn {
+    padding: 8px 12px;
+    min-height: 40px;
+    font-size: 12.5px;
+  }
+
+  /* 会话级入库面板收紧 */
+  .kb-panel {
+    margin: 0 10px;
+  }
+}
 </style>

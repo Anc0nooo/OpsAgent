@@ -20,12 +20,17 @@ const sidebarCollapsed = ref(false)
 const currentSessionId = ref<string | null>(null)
 const sidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null)
 
-// 移动端检测：< 768px 自动折叠
+// 移动端检测：< 768px 视为移动端（侧边栏改为 Vant 抽屉）
 const isMobile = ref(false)
+/** 移动端抽屉是否打开（仅 isMobile 时使用） */
+const drawerOpen = ref(false)
 function checkMobile() {
-  isMobile.value = window.innerWidth < 768
-  if (isMobile.value) {
-    sidebarCollapsed.value = true
+  const mobile = window.innerWidth < 768
+  isMobile.value = mobile
+  if (mobile) {
+    // 移动端：PC 折叠态无意义，保持 false；抽屉默认关闭
+    sidebarCollapsed.value = false
+    drawerOpen.value = false
   }
 }
 
@@ -89,6 +94,8 @@ function openSettingsFromChild(e: Event) {
 // ---------------- 侧边栏事件处理 ----------------
 function onNewChat() {
   currentSessionId.value = null
+  // 移动端：新建对话后收起抽屉
+  drawerOpen.value = false
   // 如果当前在知识库页，切回对话页
   if (route.path !== '/') {
     router.push('/')
@@ -106,18 +113,22 @@ function onSelectSession(sessionId: string) {
     // 已在对话页，通过事件通知 ChatView 加载会话
     window.dispatchEvent(new CustomEvent('opsagent:load-session', { detail: { sessionId } }))
   }
-  // 移动端自动折叠
-  if (window.innerWidth < 768) {
-    sidebarCollapsed.value = true
-  }
+  // 移动端选择会话后自动收起抽屉
+  drawerOpen.value = false
 }
 
 function onToggleCollapse() {
+  // 移动端侧边栏在抽屉里：折叠按钮 = 关闭抽屉
+  if (isMobile.value) {
+    drawerOpen.value = false
+    return
+  }
   sidebarCollapsed.value = !sidebarCollapsed.value
 }
 
 function openSettings() {
   isFirstTime.value = false
+  drawerOpen.value = false
   showSettings.value = true
 }
 
@@ -161,15 +172,9 @@ onBeforeUnmount(() => {
   </div>
 
   <div v-else class="app-layout">
-    <!-- 移动端遮罩 -->
-    <div
-      v-if="!sidebarCollapsed && isMobile"
-      class="sidebar-overlay"
-      @click="sidebarCollapsed = true"
-    />
-
-    <!-- 左侧边栏 -->
+    <!-- 桌面端左侧边栏（移动端改为 Vant 抽屉，见下方 van-popup） -->
     <AppSidebar
+      v-if="!isMobile"
       ref="sidebarRef"
       :collapsed="sidebarCollapsed"
       :current-session-id="currentSessionId"
@@ -179,10 +184,42 @@ onBeforeUnmount(() => {
       @open-settings="openSettings"
     />
 
+    <!-- 移动端侧边栏抽屉（Vant Popup position="left"，自带遮罩与滑入动画） -->
+    <van-popup
+      v-else
+      v-model:show="drawerOpen"
+      position="left"
+      class="mobile-drawer"
+      teleport="body"
+      :style="{ width: '85vw', maxWidth: '320px', height: '100%' }"
+    >
+      <AppSidebar
+        ref="sidebarRef"
+        :collapsed="false"
+        :current-session-id="currentSessionId"
+        @new-chat="onNewChat"
+        @select-session="onSelectSession"
+        @toggle-collapse="onToggleCollapse"
+        @open-settings="openSettings"
+      />
+    </van-popup>
+
     <!-- 右侧主内容区 -->
     <div class="main-area">
       <!-- 顶部标题栏 -->
       <header class="main-header">
+        <!-- 移动端汉堡菜单按钮（呼出抽屉） -->
+        <button
+          class="menu-btn mobile-only"
+          aria-label="打开菜单"
+          @click="drawerOpen = true"
+        >
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="3" y1="6" x2="21" y2="6"/>
+            <line x1="3" y1="12" x2="21" y2="12"/>
+            <line x1="3" y1="18" x2="21" y2="18"/>
+          </svg>
+        </button>
         <div class="header-title">{{ headerTitle }}</div>
         <div class="header-actions">
           <!-- 对话/知识库切换 -->
@@ -198,10 +235,10 @@ onBeforeUnmount(() => {
               @click="switchView('knowledge')"
             >知识库</button>
           </div>
-          <!-- API Key 状态指示 -->
+          <!-- API Key 状态指示（移动端隐藏，避免顶栏拥挤；状态在设置弹窗内可见） -->
           <span
             v-if="settingsStatus && (!settingsStatus.chat_configured || !settingsStatus.dashscope_configured)"
-            class="key-indicator"
+            class="key-indicator pc-only"
             title="API Key 未配置，点击设置"
             @click="() => { isFirstTime = true; showSettings = true }"
           >⚠ 未配置</span>
@@ -255,14 +292,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-/* 移动端遮罩 */
-.sidebar-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.3);
-  z-index: 99;
-}
-
 /* 右侧主区 */
 .main-area {
   flex: 1;
@@ -278,6 +307,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 0 20px;
   height: 52px;
   background: rgba(255, 255, 255, 0.72);
@@ -286,6 +316,22 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--border);
   z-index: 10;
 }
+
+/* 移动端汉堡按钮（桌面端 display:none 由 .mobile-only 控制） */
+.menu-btn {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-main);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .header-title {
   font-size: 14.5px;
   font-weight: 600;
@@ -368,13 +414,50 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
-/* 移动端：顶部标题栏左侧加菜单按钮（由侧边栏折叠按钮替代，这里不需要额外） */
+/* ============================================================
+   移动端适配（< 768px）：
+   - 布局高度改用 --app-height（软键盘弹出时跟随 visualViewport 收缩）
+   - 顶栏：汉堡 + 居中标题 + 操作区
+   - 抽屉由 van-popup 承载（teleport 到 body），.mobile-drawer 只负责内容填充
+   ============================================================ */
+.mobile-drawer {
+  background: #f7f7f8;
+}
+.mobile-drawer :deep(.sidebar) {
+  border-right: none;
+}
+
 @media (max-width: 768px) {
+  .login-shell,
+  .app-layout {
+    /* 软键盘弹出时 100vh 不收缩，用 JS 同步的可视高度代替 */
+    height: var(--app-height, 100vh);
+  }
+
   .main-header {
-    padding: 0 12px;
+    padding: 0 8px 0 4px;
+    gap: 4px;
   }
   .header-title {
-    font-size: 13.5px;
+    flex: 1;
+    text-align: center;
+    font-size: 14px;
+    padding: 0 4px;
+  }
+  .header-actions {
+    gap: 4px;
+  }
+  /* 对话/知识库切换器在移动端收紧 */
+  .view-switcher {
+    padding: 2px;
+  }
+  .switch-btn {
+    padding: 6px 10px;
+    font-size: 12.5px;
+  }
+  .settings-btn {
+    width: 40px;
+    height: 40px;
   }
 }
 </style>

@@ -232,4 +232,36 @@ async function submit() {
   opacity: 0.6;
   cursor: default;
 }
+
+/* 移动端（<768px）：卡片近全宽、输入区 ≥48px 触控、16px 字号防 iOS 聚焦缩放 */
+@media (max-width: 768px) {
+  .login-page {
+    padding: 0 16px;
+    align-items: flex-start;
+    padding-top: 12vh;
+    height: var(--app-height, 100vh);
+  }
+  .login-card {
+    width: 100%;
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 28px 20px 24px;
+    border-radius: 12px;
+  }
+  .form-input {
+    height: 48px;
+    padding: 12px 14px;
+    font-size: 16px;
+  }
+  .submit-btn {
+    min-height: 48px;
+    font-size: 16px;
+  }
+  .tab-btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    font-size: 15px;
+  }
+}
 </style>

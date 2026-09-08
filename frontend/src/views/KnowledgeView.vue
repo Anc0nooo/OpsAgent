@@ -146,6 +146,12 @@ async function onFilePicked(ev: Event) {
   }
 }
 
+/** 移动端悬浮按钮：切到"上传文件"页签并直接拉起文件选择 */
+function onFabUpload() {
+  activeTab.value = 'file'
+  fileInput.value?.click()
+}
+
 // ---------------- 粘贴文本入库 ----------------
 const pasteTitle = ref('')
 const pasteType = ref('guide')
@@ -549,6 +555,15 @@ onMounted(refreshDocs)
       </section>
     </div>
 
+    <!-- 移动端悬浮上传按钮（桌面端由 scoped 媒体查询隐藏；点击直接拉起文件选择） -->
+    <van-floating-bubble
+      class="kb-fab"
+      icon="plus"
+      axis="xy"
+      magnetic="x"
+      @click="onFabUpload"
+    />
+
     <!-- 文档查看/编辑弹窗 -->
     <DocViewDialog v-model:visible="viewerVisible" :doc-id="viewerDocId" @saved="onSaved" />
   </div>
@@ -917,11 +932,37 @@ onMounted(refreshDocs)
   }
   .kb-left { max-height: 360px; }
 }
+
+/* 移动端（<768px）：单列纵向堆叠，上传区在上、列表其次、检索最后；
+   悬浮上传按钮仅在移动端显示（桌面端隐藏） */
+.kb-fab {
+  display: none;
+}
 @media (max-width: 767px) {
+  .kb-page {
+    padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px));
+  }
   .kb-cols {
     grid-template-columns: 1fr;
-    grid-template-areas: "left" "mid" "right";
+    grid-template-areas: "mid" "left" "right";
+    gap: 12px;
   }
-  .kb-left { max-height: 300px; }
+  .kb-left { max-height: none; }
+  .kb-col-body {
+    padding: 12px;
+  }
+  /* 页签 / 输入框 / 按钮触控区域 ≥44px，字号 16px 防 iOS 聚焦缩放 */
+  .tab-btn {
+    padding: 10px 6px;
+    min-height: 44px;
+    font-size: 13.5px;
+  }
+  .input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .kb-fab {
+    display: flex; /* 保持 Vant 默认 flex 居中（桌面端为 none） */
+  }
 }
 </style>

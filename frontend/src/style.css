@@ -112,3 +112,63 @@ a {
 .el-button--small {
   font-size: 14px;
 }
+
+/* ============================================================
+   移动端全局基建（断点 768px，<768px 视为移动端）
+   ============================================================ */
+
+/* 移动端显示 / 桌面端显示 工具类 */
+.mobile-only {
+  display: none !important;
+}
+@media (max-width: 768px) {
+  .mobile-only {
+    display: inline-flex !important;
+  }
+  .pc-only {
+    display: none !important;
+  }
+
+  /* 全局禁止横向滚动（页面级滚动条只允许纵向） */
+  html,
+  body {
+    overflow-x: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* 去掉移动端点击灰色高亮 */
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Vant 弹窗/抽屉内字体跟随全局 */
+  .van-popup,
+  .van-dialog,
+  .van-floating-bubble {
+    font-family: inherit;
+  }
+
+  /* Element Plus 弹窗固定 px 宽度在窄屏会溢出，统一约束 */
+  .el-dialog {
+    width: calc(100vw - 24px) !important;
+    max-width: 380px;
+  }
+  .el-message-box {
+    width: calc(100vw - 32px) !important;
+    max-width: 380px;
+  }
+}
+
+/* 安全区工具类（刘海屏底部横条） */
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* 触控区域兜底：交互元素最小 44px（iOS HIG） */
+@media (max-width: 768px) {
+  button,
+  .el-button,
+  .van-button {
+    min-height: 40px;
+  }
+}
