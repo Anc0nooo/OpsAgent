@@ -23,7 +23,7 @@ const router = createRouter({
       path: '/',
       name: 'chat',
       component: () => import('../views/ChatView.vue'),
-      meta: { title: '运维对话' },
+      meta: { title: '对话' },
     },
     {
       path: '/knowledge',
@@ -57,10 +57,9 @@ router.beforeEach((to) => {
   }
 })
 
-// 路由后置守卫：同步页面标题
-router.afterEach((to) => {
-  const title = to.meta.title as string | undefined
-  document.title = title ? `${title} - OpsAgent` : 'OpsAgent 运维智能体'
+// 路由后置守卫：浏览器标签页标题统一为 OpsAgent（页面内大标题由各视图/顶栏自行展示）
+router.afterEach(() => {
+  document.title = 'OpsAgent'
 })
 
 export default router

@@ -53,7 +53,7 @@ function switchView(view: 'chat' | 'knowledge') {
 // ---------------- 顶部标题栏标题 ----------------
 const headerTitle = computed(() => {
   if (route.path === '/knowledge') return '知识库管理'
-  return '运维对话'
+  return '对话'
 })
 
 // ---------------- 设置弹窗 ----------------
