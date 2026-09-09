@@ -142,3 +142,19 @@ class OperationLog(Base):
         Index("idx_log_user", "user_id"),
         Index("idx_log_time", "created_at"),
     )
+
+
+class AppVersion(Base):
+    """应用版本与更新日志（单行表，id 恒为 1；管理员在后台维护）
+
+    - version：当前版本号，如 v1.1
+    - changelog：更新日志，Markdown 富文本（前端 marked 渲染）
+    前端登录后比对 localStorage 的 last_version，不一致则弹出更新弹窗。
+    """
+    __tablename__ = "app_version"
+
+    id = Column(Integer, primary_key=True, autoincrement=False)  # 恒为 1（单行）
+    version = Column(String(20), nullable=False, default="v1.0")
+    changelog = Column(MEDIUMTEXT, nullable=False, default="")
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=sa_text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))

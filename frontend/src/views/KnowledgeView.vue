@@ -6,7 +6,7 @@
  * 右栏：检索测试（输入行 + 结果区，结果多时内部滚动）
  * 整体高度 = 视口 - 顶部导航，不出现页面级滚动；< 1200px 降为上下布局
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import DocViewDialog from '../components/DocViewDialog.vue'
 import {
   addText,
@@ -146,10 +146,34 @@ async function onFilePicked(ev: Event) {
   }
 }
 
-/** 移动端悬浮按钮：切到"上传文件"页签并直接拉起文件选择 */
+/** 移动端悬浮按钮：点击弹出上传方式选择 ActionSheet */
+const fabSheetOpen = ref(false)
 function onFabUpload() {
-  activeTab.value = 'file'
-  fileInput.value?.click()
+  fabSheetOpen.value = true
+}
+
+/** ActionSheet 选项 */
+const fabActions = [
+  { name: '选择文件上传' },
+  { name: '粘贴文本导入' },
+  { name: '导入聊天记录' },
+]
+
+/** 选择上传方式后：切换对应页签并滚动到上传面板；"选择文件"直接拉起文件选择器 */
+async function onFabAction(item: { name: string }) {
+  fabSheetOpen.value = false
+  if (item.name === '选择文件上传') {
+    activeTab.value = 'file'
+    await nextTick()
+    fileInput.value?.click()
+  } else if (item.name === '粘贴文本导入') {
+    activeTab.value = 'paste'
+  } else if (item.name === '导入聊天记录') {
+    activeTab.value = 'chat'
+  }
+  // 滚动到上传面板（移动端单列顺序中它在最上方）
+  await nextTick()
+  document.querySelector('.kb-mid')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 // ---------------- 粘贴文本入库 ----------------
@@ -555,13 +579,22 @@ onMounted(refreshDocs)
       </section>
     </div>
 
-    <!-- 移动端悬浮上传按钮（桌面端由 scoped 媒体查询隐藏；点击直接拉起文件选择） -->
-    <van-floating-bubble
-      class="kb-fab"
-      icon="plus"
-      axis="xy"
-      magnetic="x"
-      @click="onFabUpload"
+    <!-- 移动端悬浮上传按钮：仅 <768px 显示（PC 端由 CSS 隐藏），点击弹出上传方式选择 -->
+    <button class="kb-fab" aria-label="上传文档" @click="onFabUpload">
+      <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+           stroke-width="2.4" stroke-linecap="round">
+        <line x1="12" y1="5" x2="12" y2="19"/>
+        <line x1="5" y1="12" x2="19" y2="12"/>
+      </svg>
+    </button>
+
+    <!-- 移动端上传方式选择面板（底部弹出） -->
+    <van-action-sheet
+      v-model:show="fabSheetOpen"
+      :actions="fabActions"
+      cancel-text="取消"
+      close-on-click-action
+      @select="onFabAction"
     />
 
     <!-- 文档查看/编辑弹窗 -->
@@ -933,22 +966,37 @@ onMounted(refreshDocs)
   .kb-left { max-height: 360px; }
 }
 
-/* 移动端（<768px）：单列纵向堆叠，上传区在上、列表其次、检索最后；
-   悬浮上传按钮仅在移动端显示（桌面端隐藏） */
+/* 移动端悬浮上传按钮：PC 端（≥768px）完全隐藏，仅移动端显示 */
 .kb-fab {
   display: none;
 }
 @media (max-width: 767px) {
+  /* 移动端：整页改为普通文档流，高度 auto，自然纵向堆叠，
+     滚动交给外层 .main-content（App.vue 移动端 overflow-y:auto），
+     不再用固定 100% 高度 + overflow:hidden 把底部检索区裁掉 */
   .kb-page {
-    padding: 10px 10px calc(10px + env(safe-area-inset-bottom, 0px));
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+    padding: 12px 12px calc(16px + env(safe-area-inset-bottom, 0px));
   }
   .kb-cols {
+    flex: none;
     grid-template-columns: 1fr;
     grid-template-areas: "mid" "left" "right";
     gap: 12px;
+    overflow: visible;
+    min-height: 0;
+  }
+  /* 每个卡片为普通块，高度随内容；卡片内部不单独滚动（整页一起滚） */
+  .kb-col {
+    overflow: visible;
+    min-height: 0;
   }
   .kb-left { max-height: none; }
   .kb-col-body {
+    flex: none;
+    overflow: visible;
     padding: 12px;
   }
   /* 页签 / 输入框 / 按钮触控区域 ≥44px，字号 16px 防 iOS 聚焦缩放 */
@@ -961,8 +1009,30 @@ onMounted(refreshDocs)
     min-height: 44px;
     font-size: 16px;
   }
+
+  /* 悬浮加号按钮：56px 标准尺寸，距右下角 16px，固定在可视区域 */
   .kb-fab {
-    display: flex; /* 保持 Vant 默认 flex 居中（桌面端为 none） */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    right: 16px;
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    width: 56px;
+    height: 56px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--primary);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(77, 107, 254, 0.4);
+    z-index: 100; /* 低于 Vant ActionSheet（z-index 2000+） */
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.15s;
+  }
+  .kb-fab:active {
+    transform: scale(0.92);
   }
 }
 </style>

@@ -134,6 +134,17 @@ a {
   body {
     overflow-x: hidden;
     -webkit-text-size-adjust: 100%;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /* 根容器移动端全宽：去掉桌面侧留白 padding 与任何限宽居中，
+     页面内部各自带 12px 内边距，避免双重留白造成"居中窄卡片"观感 */
+  #app {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
   }
 
   /* 去掉移动端点击灰色高亮 */

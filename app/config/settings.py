@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     # ---- JWT 鉴权 ----
     JWT_SECRET: str = "OpsAgent2026SecretKeyForJwtTokenGenerationAtLeast32Chars"
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_DAYS: int = 7
+    JWT_EXPIRE_HOURS: int = 5  # token 有效期（小时）：登录一次后 5 小时需重新登录
+    JWT_EXPIRE_MINUTES: int = 0  # 调试用：>0 时按分钟过期（便于自测），正式环境留 0
 
     # ---- 管理员 ----
     ADMIN_USERNAME: str = ""  # 启动时将该用户自动设为 ancon；留空则首个注册用户为 ancon

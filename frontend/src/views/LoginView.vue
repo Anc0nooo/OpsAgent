@@ -4,13 +4,26 @@
  * - 登录成功：存 token → 拉取用户信息 → 跳首页
  * - 注册成功：自动切换到登录（回填用户名）
  */
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { showToast } from 'vant'
 import { login, register } from '../api/auth'
 import { loadUser } from '../store/user'
+import { consumeAuthExpiredFlag } from '../api/token'
 
 const router = useRouter()
+
+// 由 401 拦截器跳转而来时，提示"登录已过期"（标记在整页跳转后仍保留，消费一次即清）
+onMounted(() => {
+  if (consumeAuthExpiredFlag()) {
+    if (window.innerWidth < 768) {
+      showToast('登录已过期，请重新登录')
+    } else {
+      ElMessage.warning('登录已过期，请重新登录')
+    }
+  }
+})
 
 const mode = ref<'login' | 'register'>('login')
 const username = ref('')

@@ -21,6 +21,7 @@ from app.db.engine import init_db
 from app.output.api import router as output_router
 from app.rag.api import router as knowledge_router
 from app.rag.service import knowledge_service
+from app.version.api import router as version_router
 
 # 统一日志格式
 logging.basicConfig(
@@ -55,6 +56,7 @@ app.include_router(agent_router)
 app.include_router(chat_router)
 app.include_router(output_router)
 app.include_router(admin_router)
+app.include_router(version_router)
 
 
 # 全局异常兜底：统一返回 {code, message, data}

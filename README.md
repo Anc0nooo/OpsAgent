@@ -85,7 +85,10 @@ MYSQL_DATABASE=opsagent
 
 # JWT 鉴权（生产环境务必换成随机 32 位以上字符串）
 JWT_SECRET=OpsAgent2026SecretKeyForJwtTokenGenerationAtLeast32Chars
-JWT_EXPIRE_DAYS=7
+# token 有效期（小时）：登录一次后 5 小时需重新登录
+JWT_EXPIRE_HOURS=5
+# 调试用：>0 时按分钟过期（如 1 便于自测过期跳转），正式环境留 0
+JWT_EXPIRE_MINUTES=0
 
 # 阿里百炼（可选：全局兜底 Key；推荐每个用户在设置弹窗里配置自己的 Key）
 DASHSCOPE_API_KEY=
@@ -224,7 +227,8 @@ npm run dev
 | `MYSQL_USER` / `MYSQL_PASSWORD` | MySQL 账号密码（必填） | `root` / — |
 | `MYSQL_DATABASE` | 业务库名（自动建表） | `opsagent` |
 | `JWT_SECRET` | JWT 签名密钥（≥32 位随机字符串，生产必改） | 内置默认 |
-| `JWT_ALGORITHM` / `JWT_EXPIRE_DAYS` | 签名算法 / token 有效期 | `HS256` / `7` |
+| `JWT_ALGORITHM` / `JWT_EXPIRE_HOURS` | 签名算法 / token 有效期（小时，默认 5 小时后需重新登录） | `HS256` / `5` |
+| `JWT_EXPIRE_MINUTES` | 调试用：>0 时按分钟过期（自测过期跳转用），正式环境留 `0` | `0` |
 | `ADMIN_USERNAME` | 指定首个管理员用户名（可选） | 空（首个注册者自动成为管理员） |
 | `DASHSCOPE_API_KEY` | 全局兜底 Key（用户未在设置弹窗配置时使用） | 空 |
 | `DASHSCOPE_BASE_URL` | 百炼 OpenAI 兼容 base_url | `https://dashscope.aliyun.com/compatible-mode/v1` |

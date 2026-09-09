@@ -73,6 +73,32 @@ def _migrate_schema() -> None:
             logger.info("已将第一个用户设为管理员（ancon）")
 
 
+def _seed_app_version() -> None:
+    """播种版本单行表（id=1）：不存在则用 settings.APP_VERSION 初始化"""
+    from app.db.models import AppVersion
+
+    db = SessionLocal()
+    try:
+        row = db.query(AppVersion).filter(AppVersion.id == 1).first()
+        if row is None:
+            db.add(AppVersion(
+                id=1,
+                version=settings.APP_VERSION or "v1.0",
+                changelog=(
+                    "## 欢迎使用 OpsAgent 运维智能体\n\n"
+                    "- 多用户登录与知识库隔离\n"
+                    "- RAG 知识库问答 + Agent 方案规划\n"
+                    "- 人工在环只读 SQL 挂起续推\n"
+                    "- 管理后台（用户 / 日志 / 版本更新）\n"
+                    "- 移动端自适应（手机浏览器可用）\n"
+                ),
+            ))
+            db.commit()
+            logger.info("已初始化应用版本: %s", settings.APP_VERSION)
+    finally:
+        db.close()
+
+
 def init_db() -> None:
     """建表（幂等：已存在的表不会被重建）+ 轻量补列迁移"""
     # 导入所有模型，确保 create_all 能发现它们
@@ -80,5 +106,6 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _migrate_schema()
+    _seed_app_version()
     logger.info("MySQL 表已就绪: %s@%s:%s/%s", settings.MYSQL_USER, settings.MYSQL_HOST,
                 settings.MYSQL_PORT, settings.MYSQL_DATABASE)

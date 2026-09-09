@@ -116,7 +116,7 @@ function autoResize() {
 const inputPlaceholder = computed(() =>
   pending.value
     ? `粘贴 SQL 执行结果（请先脱敏，不要包含完整患者信息）… 第 ${pending.value.round}/5 轮`
-    : '输入你的运维问题…（Enter 发送，Shift+Enter 换行）',
+    : 'Enter 发送，Shift+Enter 换行',
 )
 
 /** 发送消息（SSE 流式） */
@@ -636,12 +636,14 @@ watch(() => messages.value.length, scrollToBottom)
   display: flex;
   flex-direction: column;
   background: var(--bg);
+  min-height: 0;
 }
 
 /* ---------- 消息区 ---------- */
 .msg-scroll {
   flex: 1;
   overflow-y: auto;
+  min-height: 0; /* flex 子项可收缩，消息区独立滚动，把输入框自然顶到底部 */
 }
 .msg-list {
   max-width: 760px;
@@ -1203,9 +1205,22 @@ watch(() => messages.value.length, scrollToBottom)
    输入框自然停在键盘上方，无需额外 JS 定位。
    ============================================================ */
 @media (max-width: 768px) {
-  /* 消息滚动： iOS 顺滑滚动 */
+  /* 对话页：flex 列布局填满主内容区；消息区占满并内部滚动，输入区不收缩、钉在底部 */
+  .chat-page {
+    height: 100%;
+    width: 100%;
+    max-width: none;
+    overflow: hidden;
+  }
   .msg-scroll {
+    flex: 1 1 0;
+    min-height: 0;
     -webkit-overflow-scrolling: touch;
+  }
+  .input-area {
+    flex: 0 0 auto;
+    width: 100%;
+    box-sizing: border-box;
   }
   .msg-list {
     padding: 14px 12px 0;

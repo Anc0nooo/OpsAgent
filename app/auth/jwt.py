@@ -8,13 +8,21 @@ from app.config.settings import settings
 
 
 def create_token(user_id: int, username: str, role: str = "user") -> str:
-    """生成 JWT token（含 user_id + username + role，有效期 JWT_EXPIRE_DAYS 天）"""
+    """生成 JWT token（含 user_id + username + role）
+
+    有效期：JWT_EXPIRE_MINUTES>0 时按分钟（调试用），否则按 JWT_EXPIRE_HOURS 小时（默认 5 小时）。
+    """
+    now = datetime.now(timezone.utc)
+    if settings.JWT_EXPIRE_MINUTES and settings.JWT_EXPIRE_MINUTES > 0:
+        expire_delta = timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
+    else:
+        expire_delta = timedelta(hours=settings.JWT_EXPIRE_HOURS)
     payload: dict[str, Any] = {
         "user_id": user_id,
         "username": username,
         "role": role,
-        "exp": datetime.now(timezone.utc) + timedelta(days=settings.JWT_EXPIRE_DAYS),
-        "iat": datetime.now(timezone.utc),
+        "exp": now + expire_delta,
+        "iat": now,
     }
     return pyjwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 

@@ -645,6 +645,7 @@ defineExpose({ refreshSessions })
 /* 会话列表 */
 .session-list {
   flex: 1;
+  min-height: 0; /* flex 子项可收缩：会话过多时此处内部滚动，不把底部用户栏挤出屏幕 */
   overflow-y: auto;
   padding: 4px 8px;
 }
@@ -779,6 +780,7 @@ defineExpose({ refreshSessions })
 /* 折叠迷你列表 */
 .session-list-mini {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -892,6 +894,7 @@ defineExpose({ refreshSessions })
 /* 底部 */
 .sidebar-bottom {
   flex: none;
+  margin-top: auto; /* 兜底：始终贴侧边栏最底部（即使历史列表很短/为空） */
   position: relative;
   display: flex;
   align-items: center;
@@ -912,13 +915,16 @@ defineExpose({ refreshSessions })
 }
 .settings-btn {
   flex: none;
-  margin-left: auto;
 }
 .sidebar-bottom.collapsed .settings-btn {
   margin-left: 0;
 }
+/* 模型状态：占满中间剩余空间（flex-grow），过长文字省略号，
+   自然把右侧齿轮顶到最右。不要给齿轮加 margin-left:auto——
+   auto margin 会先于 flex-grow 吃掉剩余空间，两者竞争会在窄抽屉下
+   导致模型文字被压缩、齿轮悬在中部、右侧留空。 */
 .model-status {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   display: inline-flex;
   align-items: center;
@@ -1047,8 +1053,8 @@ defineExpose({ refreshSessions })
   display: none;
 }
 
-/* 移动端响应式：< 768px 侧边栏由 App.vue 的 van-popup 抽屉承载，
-   这里只需填满抽屉容器（定位 / 遮罩 / 滑入动画全部交给 Vant） */
+/* 移动端响应式：< 768px 侧边栏由 App.vue 的 .sidebar-host 离屏抽屉承载，
+   这里只需填满抽屉容器（定位 / 遮罩 / 滑入位移全部在 App.vue 媒体查询中） */
 @media (max-width: 768px) {
   .sidebar,
   .sidebar.collapsed {

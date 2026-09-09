@@ -4,7 +4,7 @@
  * - 操作日志：列表/按用户查/导出 CSV
  */
 import { createAuthHttp } from './request'
-import { getToken } from './token'
+import { getToken, handleUnauthorized } from './token'
 
 const http = createAuthHttp({ baseURL: '/api/admin', timeout: 30000 })
 
@@ -105,7 +105,10 @@ export async function exportLogs(params: {
   const resp = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   })
-  if (!resp.ok) throw new Error('导出失败')
+  if (!resp.ok) {
+    if (resp.status === 401) handleUnauthorized()
+    throw new Error(resp.status === 401 ? '登录已过期，请重新登录' : '导出失败')
+  }
   const blob = await resp.blob()
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)

@@ -143,6 +143,41 @@
           </el-descriptions-item>
         </el-descriptions>
       </el-tab-pane>
+
+      <!-- ===== 版本更新 ===== -->
+      <el-tab-pane label="版本更新" name="version">
+        <div class="ver-pane">
+          <div class="ver-form">
+            <div class="ver-field">
+              <label>当前版本号</label>
+              <el-input v-model="verForm.version" placeholder="如 v1.1" style="max-width: 220px" />
+            </div>
+            <div class="ver-field">
+              <label>更新日志（支持 Markdown）</label>
+              <el-input
+                v-model="verForm.changelog"
+                type="textarea"
+                :rows="14"
+                placeholder="支持 Markdown，例如：&#10;## v1.1 更新内容&#10;- 新增移动端自适应&#10;- 修复指代消解问题"
+              />
+            </div>
+            <div class="ver-actions">
+              <el-button @click="loadVersion">重新加载</el-button>
+              <el-button type="primary" :loading="verSaving" @click="saveVersion">保存并发布</el-button>
+            </div>
+            <p class="ver-tip">
+              保存后，所有用户下次登录（或刷新）若本地记录的版本号与当前不一致，会弹出更新提示；
+              用户点「知道了」后不再重复弹出。
+            </p>
+          </div>
+          <div class="ver-preview">
+            <div class="ver-preview-title">预览</div>
+            <div class="ver-preview-badge">{{ verForm.version || 'v1.0' }}</div>
+            <!-- eslint-disable-next-line vue/no-v-html -->
+            <div class="md-body ver-preview-body" v-html="verPreviewHtml" />
+          </div>
+        </div>
+      </el-tab-pane>
     </el-tabs>
 
     <!-- 改角色弹窗 -->
@@ -171,13 +206,15 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ArrowDown } from '@element-plus/icons-vue'
+import { marked } from 'marked'
 import {
   deleteUser, exportLogs, listLogs, listUsers, resetPassword,
   updateRole, updateStatus, type AdminUserItem, type LogItem,
 } from '../api/admin'
+import { getVersion, updateVersion } from '../api/version'
 import { confirmDanger } from '../utils/dialog'
 
 const activeTab = ref('users')
@@ -331,6 +368,43 @@ async function handleExport() {
   }
 }
 
+// ===== 版本更新 =====
+const verForm = reactive({ version: '', changelog: '' })
+const verSaving = ref(false)
+
+const verPreviewHtml = computed(() => {
+  const md = verForm.changelog.trim()
+  if (!md) return '<p style="color:#8a8f99">暂无更新日志</p>'
+  return marked.parse(md, { async: false }) as string
+})
+
+async function loadVersion() {
+  try {
+    const info = await getVersion()
+    verForm.version = info.version
+    verForm.changelog = info.changelog
+  } catch (e: any) {
+    ElMessage.error(e.message || '版本加载失败')
+  }
+}
+
+async function saveVersion() {
+  const version = verForm.version.trim()
+  if (!version) {
+    ElMessage.warning('请填写版本号')
+    return
+  }
+  verSaving.value = true
+  try {
+    await updateVersion({ version, changelog: verForm.changelog })
+    ElMessage.success(`已发布 ${version}，用户下次登录将看到更新提示`)
+  } catch (e: any) {
+    ElMessage.error(e.message || '保存失败')
+  } finally {
+    verSaving.value = false
+  }
+}
+
 onMounted(async () => {
   // 拿当前用户 ID（禁止操作自己）
   const token = localStorage.getItem('opsagent_token')
@@ -342,6 +416,7 @@ onMounted(async () => {
   }
   await loadUsers(1)
   await loadLogs(1)
+  await loadVersion()
 })
 </script>
 
@@ -387,10 +462,73 @@ onMounted(async () => {
   -webkit-overflow-scrolling: touch;
 }
 
-/* 移动端适配（<768px）：页面留边收紧、表格保留最小宽度后横滚 */
+/* ===== 版本更新页 ===== */
+.ver-pane {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  align-items: start;
+}
+.ver-field {
+  margin-bottom: 16px;
+}
+.ver-field label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-main, #1f2329);
+}
+.ver-actions {
+  display: flex;
+  gap: 10px;
+}
+.ver-tip {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--text-sub, #8a8f99);
+  line-height: 1.6;
+}
+.ver-preview {
+  border: 1px solid var(--border, #e9ebf0);
+  border-radius: 10px;
+  padding: 16px;
+  background: #fff;
+}
+.ver-preview-title {
+  font-size: 13px;
+  color: var(--text-sub, #8a8f99);
+  margin-bottom: 10px;
+}
+.ver-preview-badge {
+  display: inline-flex;
+  padding: 3px 12px;
+  border-radius: 999px;
+  background: var(--primary-weak, #ecf0ff);
+  color: var(--primary, #4d6bfe);
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.ver-preview-body {
+  font-size: 14px;
+  line-height: 1.7;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+/* 移动端适配（<768px）：页面留边收紧、表格保留最小宽度后横滚、版本页单列堆叠 */
 @media (max-width: 768px) {
   .admin-page {
     padding: 12px;
+  }
+  .ver-pane {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .ver-actions :deep(.el-button) {
+    min-height: 44px;
+    flex: 1;
   }
   .admin-header h2 {
     font-size: 17px;

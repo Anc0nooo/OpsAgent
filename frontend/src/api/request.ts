@@ -16,6 +16,11 @@ export interface ApiResponse<T = unknown> {
   data: T
 }
 
+/** 登录/注册接口自身的 401（用户名密码错误）不属于"登录过期"，不触发跳转提示 */
+function isAuthEndpoint(url?: string): boolean {
+  return !!url && /\/auth\/(login|register)(\?|$)/.test(url)
+}
+
 /** 从错误响应提取友好消息（后端 {message} / FastAPI {detail} / axios 默认文案） */
 function extractErrorMessage(error: { response?: { status?: number; data?: { message?: string; detail?: string } }; message?: string }): string {
   const status = error?.response?.status
@@ -62,9 +67,14 @@ export function createAuthHttp(config: { baseURL: string; timeout?: number }): A
       return response
     },
     (error) => {
-      // 401：token 无效/过期 → 清 token 跳登录
-      if (error?.response?.status === 401) {
+      const status = error?.response?.status as number | undefined
+      const url = error?.config?.url as string | undefined
+      // 401（且不是登录/注册接口本身）：token 过期/无效 → 清 token 跳登录（幂等，只处理一次）
+      if (status === 401 && !isAuthEndpoint(url)) {
         handleUnauthorized()
+        const authErr = new Error('登录已过期，请重新登录') as Error & { _authExpired?: boolean }
+        authErr._authExpired = true
+        return Promise.reject(authErr)
       }
       console.error('[OpsAgent] 请求异常:', extractErrorMessage(error))
       return Promise.reject(new Error(extractErrorMessage(error)))

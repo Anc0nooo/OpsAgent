@@ -4,13 +4,15 @@
  * - 左侧 AppSidebar：新建对话 + 搜索 + 历史列表 + 设置
  * - 右侧：顶部标题栏（会话标题 + 对话/知识库切换 + 设置）+ RouterView
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SettingsDialog from './components/SettingsDialog.vue'
 import AppSidebar from './components/AppSidebar.vue'
+import VersionDialog from './components/VersionDialog.vue'
 import { loadUser } from './store/user'
 import { refreshSettingsStatus, settingsStatus } from './store/settings'
 import { getToken } from './api/token'
+import { getVersion, type VersionInfo } from './api/version'
 
 const route = useRoute()
 const router = useRouter()
@@ -91,6 +93,36 @@ function openSettingsFromChild(e: Event) {
   showSettings.value = true
 }
 
+// ---------------- 版本更新弹窗 ----------------
+const LAST_VERSION_KEY = 'opsagent_last_version'
+const showVersion = ref(false)
+const versionInfo = ref<VersionInfo>({ version: '', changelog: '', updated_at: '' })
+const versionChecked = ref(false)
+
+/** 拉取版本并与本地 last_version 比对，不一致则弹更新弹窗（每次登录会话只检查一次） */
+async function checkVersionUpdate() {
+  if (versionChecked.value || !getToken()) return
+  versionChecked.value = true
+  try {
+    const info = await getVersion()
+    versionInfo.value = info
+    const last = localStorage.getItem(LAST_VERSION_KEY)
+    // 本地记录与当前版本不同（含首次登录 last=null）→ 弹窗
+    if (info.version && last !== info.version) {
+      showVersion.value = true
+    }
+  } catch {
+    // 版本接口失败不阻断使用
+  }
+}
+
+/** 「知道了」：记录当前版本，之后不再弹出 */
+function onVersionConfirm() {
+  if (versionInfo.value.version) {
+    localStorage.setItem(LAST_VERSION_KEY, versionInfo.value.version)
+  }
+}
+
 // ---------------- 侧边栏事件处理 ----------------
 function onNewChat() {
   currentSessionId.value = null
@@ -144,15 +176,24 @@ function onSessionCreated(e: Event) {
 
 onMounted(() => {
   checkMobile()
-  // 已登录时才拉用户信息 / 检查配置（未登录由路由守卫跳 /login）
+  // 已登录时才拉用户信息 / 检查配置 / 检查版本更新（未登录由路由守卫跳 /login）
   if (getToken()) {
     loadUser()
     checkAutoPopup()
+    checkVersionUpdate()
   }
   window.addEventListener('opsagent:open-settings', openSettingsFromChild)
   window.addEventListener('opsagent:session-created', onSessionCreated)
   window.addEventListener('resize', checkMobile)
 })
+
+// 登录后从 /login 跳回应用时，触发版本检查（onMounted 仅一次，登录发生在其后）
+watch(() => route.path, (p) => {
+  if (p !== '/login' && getToken()) {
+    checkVersionUpdate()
+  }
+})
+
 onBeforeUnmount(() => {
   window.removeEventListener('opsagent:open-settings', openSettingsFromChild)
   window.removeEventListener('opsagent:session-created', onSessionCreated)
@@ -172,37 +213,23 @@ onBeforeUnmount(() => {
   </div>
 
   <div v-else class="app-layout">
-    <!-- 桌面端左侧边栏（移动端改为 Vant 抽屉，见下方 van-popup） -->
-    <AppSidebar
-      v-if="!isMobile"
-      ref="sidebarRef"
-      :collapsed="sidebarCollapsed"
-      :current-session-id="currentSessionId"
-      @new-chat="onNewChat"
-      @select-session="onSelectSession"
-      @toggle-collapse="onToggleCollapse"
-      @open-settings="openSettings"
-    />
+    <!-- 移动端抽屉遮罩（点击关闭）；桌面端 display:none -->
+    <div class="drawer-mask" :class="{ show: drawerOpen }" @click="drawerOpen = false" />
 
-    <!-- 移动端侧边栏抽屉（Vant Popup position="left"，自带遮罩与滑入动画） -->
-    <van-popup
-      v-else
-      v-model:show="drawerOpen"
-      position="left"
-      class="mobile-drawer"
-      teleport="body"
-      :style="{ width: '85vw', maxWidth: '320px', height: '100%' }"
-    >
+    <!-- 侧边栏宿主：桌面端为左侧固定栏（常规 flex 项）；
+         移动端为离屏抽屉（position:fixed + translateX(-100%)，.open 滑入），
+         平台切换完全由 CSS 媒体查询控制，不依赖 JS 判断 -->
+    <div class="sidebar-host" :class="{ open: drawerOpen }">
       <AppSidebar
         ref="sidebarRef"
-        :collapsed="false"
+        :collapsed="isMobile ? false : sidebarCollapsed"
         :current-session-id="currentSessionId"
         @new-chat="onNewChat"
         @select-session="onSelectSession"
         @toggle-collapse="onToggleCollapse"
         @open-settings="openSettings"
       />
-    </van-popup>
+    </div>
 
     <!-- 右侧主内容区 -->
     <div class="main-area">
@@ -270,6 +297,13 @@ onBeforeUnmount(() => {
       @update:visible="(v) => { if (!v && isFirstTime) onLater(); }"
     />
   </div>
+
+  <!-- 版本更新弹窗（登录后版本号与本地不一致时弹出；所有页面通用） -->
+  <VersionDialog
+    v-model:visible="showVersion"
+    :info="versionInfo"
+    @confirm="onVersionConfirm"
+  />
 </template>
 
 <style scoped>
@@ -299,6 +333,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   overflow: hidden;
   min-width: 0;
+  min-height: 0; /* flex 子项可收缩，避免子内容把布局撑爆（配合内部 overflow） */
 }
 
 /* 顶部标题栏 */
@@ -412,26 +447,104 @@ onBeforeUnmount(() => {
 .main-content {
   flex: 1;
   overflow: hidden;
+  min-height: 0; /* flex 子项可收缩，保证内部滚动容器（对话消息区）正常工作 */
+}
+
+/* ============================================================
+   侧边栏宿主 + 抽屉遮罩（桌面默认）
+   - 桌面端：.sidebar-host 为常规 flex 项（固定在左侧）；遮罩 display:none
+   - 移动端：见下方 @media，host 变离屏抽屉，mask 浮层
+   ============================================================ */
+.sidebar-host {
+  flex: none;
+  /* 作为 flex 容器：内部 .sidebar 纵向 stretch 填满宿主全高。
+     PC 端宿主是 .app-layout(flex row) 的子项（被 stretch 到整屏高），
+     若宿主不是 flex，.sidebar 高度由内容撑开，底部用户栏会停在中间；
+     设为 flex 后 .sidebar 自动撑满，用户栏贴底。移动端宿主为 fixed 全高，同样适用。 */
+  display: flex;
+}
+.drawer-mask {
+  display: none;
 }
 
 /* ============================================================
    移动端适配（< 768px）：
    - 布局高度改用 --app-height（软键盘弹出时跟随 visualViewport 收缩）
-   - 顶栏：汉堡 + 居中标题 + 操作区
-   - 抽屉由 van-popup 承载（teleport 到 body），.mobile-drawer 只负责内容填充
+   - 侧边栏：position:fixed + translateX(-100%) 离屏，汉堡呼出滑入，遮罩点击关闭
+   - 主内容区铺满全宽；顶栏：汉堡 + 居中标题 + 操作区
    ============================================================ */
-.mobile-drawer {
-  background: #f7f7f8;
-}
-.mobile-drawer :deep(.sidebar) {
-  border-right: none;
-}
-
 @media (max-width: 768px) {
   .login-shell,
   .app-layout {
-    /* 软键盘弹出时 100vh 不收缩，用 JS 同步的可视高度代替 */
-    height: var(--app-height, 100vh);
+    /* 100vh 在手机浏览器会被地址栏遮挡；100dvh 跟随动态视口；
+       --app-height 为 JS 监听 visualViewport 写入的可视高度（软键盘弹出时收缩） */
+    height: 100vh;
+    height: 100dvh;
+    height: var(--app-height, 100dvh);
+    padding: 0;
+    margin: 0;
+    width: 100%;
+    max-width: none;
+  }
+
+  /* 主内容区在移动端铺满整个屏幕宽度（侧边栏离屏，不占 flex 空间），
+     去掉任何居中限宽 */
+  .main-area {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    min-width: 0;
+  }
+  .main-content {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    /* 移动端主内容作为纵向滚动容器（知识库等文档流页面在内部滚动）；
+       对话页自身为 100% 高 + 内部消息区滚动，互不冲突 */
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* 侧边栏：离屏抽屉 */
+  .sidebar-host {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 84vw;
+    max-width: 300px;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    z-index: 1001;
+    box-shadow: 2px 0 12px rgba(0, 0, 0, 0.18);
+    will-change: transform;
+  }
+  .sidebar-host.open {
+    transform: translateX(0);
+  }
+  /* 抽屉内侧边栏填满、去除自带边框/阴影（定位由宿主负责） */
+  .sidebar-host :deep(.sidebar),
+  .sidebar-host :deep(.sidebar.collapsed) {
+    width: 100% !important;
+    height: 100%;
+    border-right: none;
+    box-shadow: none;
+  }
+
+  /* 遮罩：覆盖全屏，半透明黑色，点击关闭 */
+  .drawer-mask {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.32);
+    z-index: 1000;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s;
+  }
+  .drawer-mask.show {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .main-header {
