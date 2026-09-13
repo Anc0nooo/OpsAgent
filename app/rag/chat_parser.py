@@ -2,20 +2,16 @@
 聊天记录解析器（微信 / 飞书 / 通用 txt 导出格式）
 
 支持多种常见格式：
+- 微信块格式（手机备份，空行分块；每块=发言人/时间/内容）：
+    AncOn
+    2026年09月13日 13:47
+    你知道吗……（内容第三行起，可多行）
+
+    张三
+    2026年09月13日 13:48
+    这么小？
 - 微信（WeChatMsg / 留痕导出，头行=昵称+时间）：
     张三 2024-01-01 10:00:00
-    你好
-
-    李四 2024-01-01 10:01:00
-    你好
-- 微信（手机备份导出，日期行独立，发言人与内容分行）：
-    2026年09月13日 14:01
-    女的相当男的
-
-    AncOn
-    或
-    2024-01-01 10:00
-    张三
     你好
 - 飞书：
     [2024-01-01 10:00:00] 张三: 你好
@@ -23,7 +19,7 @@
     2024-01-01 10:00:00 张三: 你好
     2024年01月01日 10:00 张三：你好
 
-自动识别：按各正则匹配到的消息数取最多者。
+自动识别：按各解析器匹配到的消息数取最多者。
 识别失败时由调用方降级为纯文本文档导入（不报错卡死）。
 """
 import re
@@ -47,8 +43,6 @@ WECHAT_RE = re.compile(rf"^(.+?)\s+({_DT})\s*$")
 FEISHU_RE = re.compile(rf"^\[({_DT})\]\s*(.+?)[:：]\s?(.*)$")
 # 通用：日期 时间 发送人: 内容（一行一条，兼容中文日期）
 GENERAL_RE = re.compile(rf"^({_DT})\s+(.+?)[:：]\s?(.*)$")
-# 独立日期行：整行只有一个日期时间（微信手机备份的换行格式块起点）
-DATETIME_LINE_RE = re.compile(rf"^{_DT}\s*$")
 
 
 @dataclass
@@ -151,60 +145,43 @@ def _parse_general(text: str) -> list[Message]:
     return msgs
 
 
-def _looks_like_nick(line: str) -> bool:
-    """疑似发言人昵称：短、无冒号、无句末标点（用于区分块内的昵称行与内容行）"""
-    s = line.strip()
-    if not s or len(s) > 30:
-        return False
-    if any(ch in s for ch in ":：，。！？!?；;、"):
-        return False
-    return True
-
-
 def _parse_multiline(text: str) -> list[Message]:
-    """换行格式（微信手机备份）：日期时间独占一行，发言人与内容分行。
+    """微信块格式：空行分块，每块固定结构——发言人 / 时间戳 / 消息内容（可多行）。
 
-    每个日期行开启一个消息块，块内（到下一个日期行为止）自适应两种排布：
-    - 昵称在内容前（留痕/微信官方）：日期行 → 昵称行 → 内容行（可多行）
-    - 昵称在内容后（用户样例）：日期行 → 内容行 → 空行 → 昵称行
-    仅一行内容时归为匿名消息（sender=""）。
+        AncOn
+        2026年09月13日 13:47
+        你知道吗……（第三行起为内容，可跨多行）
+
+        张三
+        2026年09月13日 13:48
+        这么小？
+
+    逐块独立解析（按一个或多个空行切块），无跨块状态机、无未知发言人：
+    - 第 1 行 = 发言人，第 2 行 = 时间戳（年月日 HH:MM[:SS]），第 3 行起 = 内容；
+    - 第 2 行不是合法时间戳的块直接跳过（不属于本格式）；
+    - 兼容"时间戳在前、发言人在后"的镜像导出变体（仍纯块解析，不跨行携带状态）。
     """
     msgs: list[Message] = []
-    lines = text.replace("\r\n", "\n").split("\n")
-    cur_dt: datetime | None = None
-    block: list[str] = []
-
-    def _flush() -> None:
-        if cur_dt is None:
-            return
-        non_empty = [ln for ln in block if ln.strip()]
-        if not non_empty:
-            return
-        sender, content = "", non_empty
-        # W2（昵称在后，用户样例式）：最后一个非空行像昵称，且它的前一行是空行
-        last = non_empty[-1].strip()
-        last_prev_blank = False
-        idx = len(block) - 1
-        while idx >= 0 and not block[idx].strip():
-            idx -= 1
-        if idx >= 1 and not block[idx - 1].strip():
-            last_prev_blank = True
-        if idx >= 0 and last_prev_blank and _looks_like_nick(last):
-            sender, content = last, non_empty[:-1]
-        # W1（昵称在前，留痕式）：日期行后紧跟昵称行，后面是内容
-        elif block[0].strip() and _looks_like_nick(block[0].strip()) and len(non_empty) >= 2:
-            sender, content = block[0].strip(), non_empty[1:]
-        msgs.append(Message(cur_dt, sender, "\n".join(content).strip()))
-
-    for line in lines:
-        stripped = line.strip()
-        if DATETIME_LINE_RE.match(stripped):
-            _flush()
-            cur_dt = _parse_dt(stripped)
-            block = []
-        elif cur_dt is not None:
-            block.append(line)
-    _flush()
+    norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    for raw_block in re.split(r"\n[ \t]*(?:\n[ \t]*)+", norm):
+        lines = [ln.strip() for ln in raw_block.split("\n") if ln.strip()]
+        if len(lines) < 3:
+            continue
+        sender, dt, content_lines = None, None, None
+        dt_line2 = _parse_dt(lines[1])
+        if dt_line2 is not None:
+            # 标准排布：发言人 → 时间 → 内容
+            sender, dt, content_lines = lines[0], dt_line2, lines[2:]
+        else:
+            # 镜像排布：时间 → 发言人 → 内容（部分导出变体）
+            dt_line1 = _parse_dt(lines[0])
+            if dt_line1 is not None:
+                sender, dt, content_lines = lines[1], dt_line1, lines[2:]
+        if sender is None or not content_lines:
+            continue
+        content = "\n".join(content_lines).strip()
+        if content:
+            msgs.append(Message(dt, sender, content))
     return msgs
 
 
