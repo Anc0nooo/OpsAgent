@@ -35,6 +35,23 @@ TYPE_SCHEMA = "schema"    # 表结构类
 TYPE_OTHER = "other"      # 其他
 ALLOWED_TYPES = [TYPE_GUIDE, TYPE_BUG, TYPE_SCHEMA, TYPE_OTHER]
 
+# 分块参数缺省值（settings.CHUNK_PROFILES 缺项时兜底）
+_CHUNK_DEFAULTS = {"chunk_size": 600, "chunk_overlap": 150, "whole_threshold": 1000}
+
+
+def get_chunk_profile(doc_type: str) -> tuple[int, int, int]:
+    """
+    按文档类型返回差异化分块参数 (chunk_size, chunk_overlap, whole_threshold)。
+    未知类型回退到 settings.CHUNK_DEFAULT_TYPE（默认 other）。
+    """
+    profiles = settings.CHUNK_PROFILES or {}
+    p = profiles.get(doc_type) or profiles.get(settings.CHUNK_DEFAULT_TYPE) or _CHUNK_DEFAULTS
+    return (
+        int(p.get("chunk_size", _CHUNK_DEFAULTS["chunk_size"])),
+        int(p.get("chunk_overlap", _CHUNK_DEFAULTS["chunk_overlap"])),
+        int(p.get("whole_threshold", _CHUNK_DEFAULTS["whole_threshold"])),
+    )
+
 
 class KnowledgeService:
     """知识库服务（多用户隔离，全局单例；方法按 user_id 隔离数据）"""
@@ -54,8 +71,8 @@ class KnowledgeService:
 
         logger.info("ChromaDB 版本: %s（持久化目录: %s）", chromadb.__version__, settings.DATA_DIR / "chroma")
         logger.info(
-            "RAG 分块配置: chunk_size=%d, overlap=%d, 相邻合并窗口=±%d, 混合召回 top_n=%d",
-            settings.CHUNK_MAX_CHARS, settings.CHUNK_OVERLAP_CHARS,
+            "RAG 分块配置（按 doc_type 差异化）: %s；相邻合并窗口=±%d, 混合召回 top_n=%d",
+            {t: get_chunk_profile(t) for t in ALLOWED_TYPES},
             settings.RAG_NEIGHBOR_WINDOW, settings.RETRIEVAL_TOP_N,
         )
         # Chroma 本地持久化（单实例访问，勿多进程同时启动后端）
@@ -197,6 +214,13 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     # 文档入库
     # ------------------------------------------------------------------
+    @staticmethod
+    def _split_typed(text: str, doc_type: str) -> list[dict]:
+        """按文档类型选择分块参数后切分（表结构类大阈值、表格按行保护）"""
+        size, overlap, whole = get_chunk_profile(doc_type)
+        return split_document(text, max_chars=size, overlap=overlap,
+                              whole_threshold=whole, doc_type=doc_type)
+
     def add_document(
         self,
         db: Session,
@@ -216,17 +240,11 @@ class KnowledgeService:
         """
         if doc_type not in ALLOWED_TYPES:
             raise ValueError(f"不支持的文档类型: {doc_type}，可选: {ALLOWED_TYPES}")
-
-        # 1. 切分
-        chunks = split_document(text, max_chars=settings.CHUNK_MAX_CHARS,
-                                overlap=settings.CHUNK_OVERLAP_CHARS,
-                                whole_threshold=settings.CHUNK_WHOLE_MAX_CHARS)
-        if not chunks:
+        if not text or not text.strip():
             raise ValueError("文档内容为空，无法入库")
 
-        col = self._get_collection(user_id)
-
-        # 2. 文档记录（append 时序号接续已有块，类型/标题沿用原文档）
+        # 1. 文档记录（append 时先取原文档：类型/标题沿用，且要用原类型的分块参数切分）
+        start_seq = 0
         if append:
             if doc_id is None:
                 raise ValueError("增量追加必须提供 doc_id")
@@ -238,7 +256,13 @@ class KnowledgeService:
             doc_type = doc["doc_type"]
         else:
             doc_id = rag_db.insert_doc(db, user_id, title=title, doc_type=doc_type, source=source)
-            start_seq = 0
+
+        # 2. 按文档类型差异化切分
+        chunks = self._split_typed(text, doc_type)
+        if not chunks:
+            raise ValueError("文档内容为空，无法入库")
+
+        col = self._get_collection(user_id)
 
         # 3. MySQL 写块 + 更新文档块数
         ids = rag_db.insert_chunks(db, doc_id, doc_type, chunks, start_seq=start_seq)
@@ -337,9 +361,9 @@ class KnowledgeService:
             return False
         if doc_type not in ALLOWED_TYPES:
             raise ValueError(f"不支持的文档类型: {doc_type}，可选: {ALLOWED_TYPES}")
-        chunks = split_document(text, max_chars=settings.CHUNK_MAX_CHARS,
-                                overlap=settings.CHUNK_OVERLAP_CHARS,
-                                whole_threshold=settings.CHUNK_WHOLE_MAX_CHARS)
+        if not text or not text.strip():
+            raise ValueError("文档内容为空，无法保存")
+        chunks = self._split_typed(text, doc_type)
         if not chunks:
             raise ValueError("文档内容为空，无法保存")
 
@@ -552,12 +576,17 @@ class KnowledgeService:
                     groups.append([s])
 
             doc_hits = [h for h in hits if h["doc_id"] == did]
+            # 合并去重窗口按该文档自身类型的 overlap（分块已按类型差异化）
+            doc_type_here = next(
+                (chunks_map[k].get("doc_type", "") for k in chunks_map if chunks_map[k].get("doc_type")), ""
+            )
+            join_overlap = get_chunk_profile(doc_type_here)[1] if doc_type_here else _CHUNK_DEFAULTS["chunk_overlap"]
             for grp in groups:
                 grp_set = set(grp)
                 seg_hits = [h for h in doc_hits if int(h["seq"]) in grp_set]
                 score = max((h["score"] for h in seg_hits), default=0.0)
                 merged_text = self._dedupe_join(
-                    [chunks_map[k]["text"] for k in grp], settings.CHUNK_OVERLAP_CHARS
+                    [chunks_map[k]["text"] for k in grp], join_overlap
                 )
                 section = next((chunks_map[k]["section"] for k in grp if chunks_map[k].get("section")), "")
                 title = doc_hits[0]["doc_title"] if doc_hits else (rag_db.get_doc(db, did, user_id) or {}).get("title", "")
@@ -598,17 +627,14 @@ class KnowledgeService:
         for d in docs:
             did = d["id"]
             old_chunks = rag_db.get_doc_chunks(db, did)
-            full_text = "\n\n".join(c["text"] for c in old_chunks).strip()
+            # 用单换行拼接：旧分块可能把一张表的字段行切到多个块，单换行能让
+            # Markdown 表格行重新连续（空行会打断表格识别），从而按新策略整张重切
+            full_text = "\n".join(c["text"] for c in old_chunks).strip()
             if not full_text:
                 continue
-            # 2. 清旧块 → 按当前策略重切 → 写回 MySQL
+            # 2. 清旧块 → 按该文档类型的当前分块策略重切 → 写回 MySQL
             rag_db.delete_chunks_by_doc(db, did)
-            new_chunks = split_document(
-                full_text,
-                max_chars=settings.CHUNK_MAX_CHARS,
-                overlap=settings.CHUNK_OVERLAP_CHARS,
-                whole_threshold=settings.CHUNK_WHOLE_MAX_CHARS,
-            )
+            new_chunks = self._split_typed(full_text, d["doc_type"])
             if not new_chunks:
                 continue
             ids = rag_db.insert_chunks(db, did, d["doc_type"], new_chunks, start_seq=0)

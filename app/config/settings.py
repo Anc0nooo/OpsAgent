@@ -60,9 +60,20 @@ class Settings(BaseSettings):
 
     # ---- 本地存储 ----
     DATA_DIR: Path = BASE_DIR / "data"       # 数据目录（SQLite + Chroma）
-    CHUNK_MAX_CHARS: int = 600               # 切分块最大字符数（中文按字符；语义边界递归切）
-    CHUNK_OVERLAP_CHARS: int = 150           # 相邻块重叠字符数（足够大，保证跨块句子完整）
-    CHUNK_WHOLE_MAX_CHARS: int = 1000        # 短文档阈值：正文小于此长度整块入库，不切分
+    # ---- RAG 分块策略（按文档类型 doc_type 差异化）----
+    # 每类三个参数：
+    #   chunk_size:      单块目标最大字符数（正文语义切分上限 / 表格按行分批的批大小）
+    #   chunk_overlap:   相邻正文块的重叠字符数（表格块不做字符重叠，改为重复表头保证自洽）
+    #   whole_threshold: 整段（正文/一张表）短于此长度则整块入库不切分；
+    #                    表结构类调大（4000），优先"一张表一个块"，避免字段与注释被切断
+    # 如需整体调参，可在 .env 以 JSON 覆盖 CHUNK_PROFILES。
+    CHUNK_PROFILES: dict[str, dict[str, int]] = {
+        "schema": {"chunk_size": 1000, "chunk_overlap": 50, "whole_threshold": 4000},  # 表结构类
+        "guide":  {"chunk_size": 700,  "chunk_overlap": 200, "whole_threshold": 1000},  # 操作指导类
+        "bug":    {"chunk_size": 600,  "chunk_overlap": 100, "whole_threshold": 800},   # BUG修复类
+        "other":  {"chunk_size": 500,  "chunk_overlap": 100, "whole_threshold": 700},   # 其他
+    }
+    CHUNK_DEFAULT_TYPE: str = "other"       # 未知 doc_type 时回退的分块档
     RAG_NEIGHBOR_WINDOW: int = 1             # 检索后同文档相邻块合并窗口（命中块 seq±N 合并为一个片段）
     RETRIEVAL_TOP_N: int = 10                # 混合召回候选数（送重排前）
     BM25_WEIGHT: float = 0.5                 # BM25 融合权重

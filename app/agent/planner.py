@@ -17,6 +17,7 @@ Agent 规划器 - 核心编排（状态机流转，prompt v2，多用户架构�
 import asyncio
 import json
 import logging
+import re
 
 from typing import AsyncIterator, Any
 
@@ -53,9 +54,33 @@ def _hit_level(rag_context: str) -> int:
     return 3
 
 
-def _codeblock_forbid_hint(level: int) -> str:
-    """根据命中层级返回动态追加的代码块禁止提示（追加到 stream/plan prompt 末尾）"""
+# 场景B检测：用户明确要求编写 SQL / 视图 / 报表 / 统计语句
+_EXPLICIT_SQL_RE = re.compile(
+    r"帮我写|给我写|给我个|帮写|写个|写一[个下]|写一下|生成[个一]|"
+    r"CREATE\s+(OR\s+REPLACE\s+)?(VIEW|PROCEDURE|FUNCTION|SYNONYM|TABLE)|"
+    r"视图|报表|统计\s*SQL|统计语句|SQL\s*怎么写",
+    re.IGNORECASE,
+)
+
+
+def _wants_sql_written(text: str) -> bool:
+    """用户是否明确要求写 SQL（场景B）——此时即使知识库 0 命中，也必须直接输出 SQL 代码块"""
+    return bool(text and _EXPLICIT_SQL_RE.search(text))
+
+
+def _codeblock_forbid_hint(level: int, explicit_sql: bool = False) -> str:
+    """根据命中层级返回动态追加的代码块提示（追加到 stream/plan prompt 末尾）。
+
+    level==0（知识库 0 命中）时默认硬禁止一切代码块，防止凭空编造管理命令；
+    但用户明确要求写 SQL（场景B）时必须放开 ```sql 代码块——只禁编造管理命令。
+    """
     if level == 0:
+        if explicit_sql:
+            return (
+                "\n\n补充：知识库 0 命中，但用户明确要求编写 SQL——这属于场景B，"
+                "必须在 answer 中直接输出完整 ```sql 代码块（只能使用用户提供的表名/字段，"
+                "并注明\"表名/字段需人工核对\"）；仍禁止编造 ALTER SYSTEM/ALTER TABLE 等管理命令代码块。"
+            )
         return (
             "\n\n⚠️⚠️⚠️ FINAL HARD CONSTRAINT (VIOLATION = FAILURE): "
             "Knowledge base has 0 hits. Your plan body MUST NOT contain ANY code block of any kind — "
@@ -65,6 +90,12 @@ def _codeblock_forbid_hint(level: int) -> str:
             "NOT write an ALTER SYSTEM SET command block)."
         )
     elif level == 1:
+        if explicit_sql:
+            return (
+                "\n\n补充：用户明确要求编写 SQL——属于场景B，直接在 answer 中输出完整 ```sql 代码块，"
+                "优先使用上方已命中的表结构字段，不确定的字段注明需人工核对；"
+                "仍不要凭空编造 ALTER SYSTEM 等管理命令。"
+            )
         return (
             "\n\n补充：本次仅命中表结构，方案中 SQL 代码块仍需知识库有对应示例才能输出，"
             "不要凭空编造 ALTER SYSTEM 等管理命令。"
@@ -171,7 +202,8 @@ class Planner:
         rag_context = build_rag_context(db, user_id, text)
 
         # 3. 单次结构化调用：need_query 判断 + 正文生成
-        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context))
+        # 用户明确要写 SQL（场景B）时放开代码块禁令，确保直接输出完整 SQL
+        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context), _wants_sql_written(text))
         prompt = prompts.PLAN_PROMPT.format(
             rag_context=rag_context,
             history=history_text,
@@ -203,7 +235,7 @@ class Planner:
         feedback = f"【第 {query_round} 轮 SQL 执行结果回传（查询目的：{purpose}；用户可能已脱敏）】\n{text}"
 
         rag_context = build_rag_context(db, user_id, feedback[:500])  # 用回传内容做一次补充检索
-        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context))
+        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context), _wants_sql_written(text))
         prompt = prompts.PLAN_PROMPT.format(
             rag_context=rag_context,
             history=history_text,
@@ -363,7 +395,8 @@ class Planner:
 
         # ① 单次 structured 调用：判断 need_query + 生成正文（prompt v2，省 token）
         yield {"type": "status", "stage": "analyze", "text": "分析问题…"}
-        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context))
+        # 用户明确要写 SQL（场景B）时放开代码块禁令，确保直接输出完整 SQL
+        forbid_hint = _codeblock_forbid_hint(_hit_level(rag_context), _wants_sql_written(judge_text))
         plan_prompt = prompts.PLAN_PROMPT.format(
             rag_context=rag_context, history=history_text, text=judge_text,
             status_note=status_note + forbid_hint,
