@@ -188,16 +188,31 @@ def import_table_schema(body: TableSchemaIn, db: Session = Depends(get_db),
 
 @router.post("/chat/parse")
 def chat_parse(body: ChatParseIn, user: User = Depends(get_current_user)) -> dict:
-    """解析聊天记录预览（不入库），返回消息数/参与人/时间范围/前10条"""
+    """解析聊天记录预览（不入库），返回消息数/参与人/时间范围/前10条。
+
+    识别失败不再报 400：返回 recognized=false + 字数，由前端提示"按纯文本导入"，用户可选继续。
+    """
     from app.rag.chat_parser import build_preview, filter_messages, parse_text
     try:
         msgs, fmt = parse_text(body.text, body.source)
         if not msgs:
-            return fail(400, "未能识别聊天记录格式，请确认是微信或飞书导出的 txt 文本")
+            # 降级：未识别为聊天记录格式 → 提示按纯文本文档导入
+            return ok({
+                "recognized": False,
+                "count": 0,
+                "participants": [],
+                "time_range": "",
+                "preview": [],
+                "format": "plain",
+                "split_mode": body.split_mode,
+                "text_length": len(body.text or ""),
+                "message": "未识别为聊天记录格式，将作为纯文本文档导入",
+            })
         msgs = filter_messages(msgs, body.filter_system, body.filter_media)
         preview = build_preview(msgs)
         preview["format"] = fmt
         preview["split_mode"] = body.split_mode
+        preview["recognized"] = True
         return ok(preview)
     except Exception as e:  # noqa: BLE001
         logger.exception("聊天记录解析失败")
@@ -207,12 +222,31 @@ def chat_parse(body: ChatParseIn, user: User = Depends(get_current_user)) -> dic
 @router.post("/chat/import")
 def chat_import(body: ChatParseIn, db: Session = Depends(get_db),
                 user: User = Depends(get_current_user)) -> dict:
-    """聊天记录导入知识库（类型固定 other，复用文本入库流程：切块→向量化→存 Chroma）"""
+    """聊天记录导入知识库（类型固定 other，复用文本入库流程：切块→向量化→存 Chroma）。
+
+    识别失败时降级：整段文本作为 1 个纯文本文档入库（doc_type=other），不报错卡死。
+    """
     from app.rag.chat_parser import filter_messages, parse_text, split_to_docs
     try:
         msgs, fmt = parse_text(body.text, body.source)
         if not msgs:
-            return fail(400, "未能识别聊天记录格式，请确认是微信或飞书导出的 txt 文本")
+            # 降级：纯文本文档整段入库
+            text = (body.text or "").strip()
+            if not text:
+                return fail(400, "导入内容为空")
+            from datetime import datetime as _dt
+            title = f"纯文本导入-{_dt.now().strftime('%Y%m%d-%H%M')}"
+            doc_id = knowledge_service.add_document(
+                db, user.id, title=title, text=text, doc_type="other", source="chat_import:plain",
+            )
+            db.commit()
+            return ok({
+                "doc_ids": [doc_id],
+                "count": 1,
+                "titles": [title],
+                "fallback": True,
+                "message": "未识别为聊天记录格式，已按纯文本文档导入（1 个）",
+            })
         msgs = filter_messages(msgs, body.filter_system, body.filter_media)
         docs = split_to_docs(msgs, body.split_mode)
         if not docs:

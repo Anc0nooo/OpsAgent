@@ -261,7 +261,7 @@ function chatBody(): ChatParseBody {
   }
 }
 
-/** 解析预览（不入库） */
+/** 解析预览（不入库）。识别失败不报错：提示将按纯文本导入，用户仍可确认 */
 async function runChatParse() {
   if (!chatText.value.trim()) {
     toast('请粘贴或上传聊天记录文本', true)
@@ -270,6 +270,10 @@ async function runChatParse() {
   chatParsing.value = true
   try {
     chatPreview.value = await parseChat(chatBody())
+    if (!chatPreview.value.recognized) {
+      // 降级提示（非报错条，导入按钮保持可点）
+      toast('未识别为聊天记录格式，将按纯文本文档导入')
+    }
   } catch (e) {
     chatPreview.value = null
     toast(e instanceof Error ? e.message : '解析失败', true)
@@ -278,13 +282,13 @@ async function runChatParse() {
   }
 }
 
-/** 确认导入知识库 */
+/** 确认导入知识库（识别失败时后端自动降级为纯文本文档） */
 async function confirmChatImport() {
-  if (!chatPreview.value) return
+  if (!chatText.value.trim()) return
   chatImporting.value = true
   try {
     const r = await importChat(chatBody())
-    toast(`成功导入 ${r.count} 个文档`)
+    toast(r.count > 0 ? `成功导入 ${r.count} 个文档` : '导入完成')
     resetChat()
     await refreshDocs()
   } catch (e) {
@@ -512,22 +516,29 @@ onMounted(refreshDocs)
             </button>
 
             <div v-if="chatPreview" class="chat-preview">
-              <div class="preview-stats">
-                <span>消息数：<b>{{ chatPreview.count }}</b></span>
-                <span>参与人：<b>{{ chatPreview.participants.length }}</b> 人</span>
-                <span>识别格式：{{ chatPreview.format }}</span>
-              </div>
-              <div class="preview-range">时间范围：{{ chatPreview.time_range }}</div>
-              <div class="preview-list">
-                <div v-for="(m, i) in chatPreview.preview" :key="i" class="preview-msg">
-                  <span class="preview-time">{{ m.time }}</span>
-                  <span class="preview-sender">{{ m.sender }}:</span>
-                  <span class="preview-content">{{ m.content }}</span>
+              <template v-if="chatPreview.recognized">
+                <div class="preview-stats">
+                  <span>消息数：<b>{{ chatPreview.count }}</b></span>
+                  <span>参与人：<b>{{ chatPreview.participants.length }}</b> 人</span>
+                  <span>识别格式：{{ chatPreview.format }}</span>
                 </div>
-              </div>
+                <div class="preview-range">时间范围：{{ chatPreview.time_range }}</div>
+                <div class="preview-list">
+                  <div v-for="(m, i) in chatPreview.preview" :key="i" class="preview-msg">
+                    <span class="preview-time">{{ m.time }}</span>
+                    <span class="preview-sender">{{ m.sender }}:</span>
+                    <span class="preview-content">{{ m.content }}</span>
+                  </div>
+                </div>
+              </template>
+              <template v-else>
+                <div class="preview-stats fallback">
+                  未识别为聊天记录格式，将作为纯文本文档导入，约 <b>{{ chatPreview.text_length ?? chatText.length }}</b> 字
+                </div>
+              </template>
             </div>
 
-            <button class="btn primary" :disabled="!chatPreview || chatImporting" @click="confirmChatImport">
+            <button class="btn primary" :disabled="!chatText.trim() || chatImporting" @click="confirmChatImport">
               {{ chatImporting ? '导入中…' : '确认导入' }}
             </button>
           </div>
@@ -840,6 +851,15 @@ onMounted(refreshDocs)
 .preview-stats b {
   color: var(--primary);
   font-weight: 600;
+}
+/* 降级提示：未识别为聊天记录格式，按纯文本导入 */
+.preview-stats.fallback {
+  display: block;
+  color: #b45309;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 8px 10px;
 }
 .preview-range {
   font-size: 13px;

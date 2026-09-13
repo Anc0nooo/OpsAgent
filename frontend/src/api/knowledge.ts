@@ -123,6 +123,11 @@ export interface ChatPreview {
   preview: { time: string; sender: string; content: string }[]
   format: string
   split_mode: string
+  /** 是否识别为聊天记录格式；false 时后端将按纯文本文档降级导入 */
+  recognized: boolean
+  /** 降级导入时的原文字数 */
+  text_length?: number
+  message?: string
 }
 
 /** 解析聊天记录预览（不入库） */

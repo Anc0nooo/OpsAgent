@@ -1,19 +1,30 @@
 """
 聊天记录解析器（微信 / 飞书 / 通用 txt 导出格式）
 
-支持三种常见格式：
-- 微信（WeChatMsg / 留痕导出）：
+支持多种常见格式：
+- 微信（WeChatMsg / 留痕导出，头行=昵称+时间）：
     张三 2024-01-01 10:00:00
     你好
 
     李四 2024-01-01 10:01:00
     你好
+- 微信（手机备份导出，日期行独立，发言人与内容分行）：
+    2026年09月13日 14:01
+    女的相当男的
+
+    AncOn
+    或
+    2024-01-01 10:00
+    张三
+    你好
 - 飞书：
     [2024-01-01 10:00:00] 张三: 你好
-- 通用：
+- 通用（一行一条，兼容中英文日期）：
     2024-01-01 10:00:00 张三: 你好
+    2024年01月01日 10:00 张三：你好
 
 自动识别：按各正则匹配到的消息数取最多者。
+识别失败时由调用方降级为纯文本文档导入（不报错卡死）。
 """
 import re
 from dataclasses import dataclass
@@ -27,12 +38,17 @@ SYSTEM_KEYWORDS = (
 # 表情/图片/语音/文件等占位符：整条内容形如 [xxx]
 MEDIA_RE = re.compile(r"^\[.*\]$")
 
+# 日期时间片段（两种写法共用）：2024-01-01 10:00[:ss] 或 2024年01月01日 10:00[:ss]（分隔符 - / . 均可）
+_DT = r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}日)\s+\d{1,2}:\d{2}(?::\d{2})?"
+
 # 微信头行：发送人 日期 时间（内容可跨行，直到下一个头行）
-WECHAT_RE = re.compile(r"^(.+?)\s+(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?)\s*$")
+WECHAT_RE = re.compile(rf"^(.+?)\s+({_DT})\s*$")
 # 飞书：[日期 时间] 发送人: 内容（兼容中英文冒号）
-FEISHU_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+?)[:：]\s?(.*)$")
-# 通用：日期 时间 发送人: 内容
-GENERAL_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?)\s+(.+?)[:：]\s?(.*)$")
+FEISHU_RE = re.compile(rf"^\[({_DT})\]\s*(.+?)[:：]\s?(.*)$")
+# 通用：日期 时间 发送人: 内容（一行一条，兼容中文日期）
+GENERAL_RE = re.compile(rf"^({_DT})\s+(.+?)[:：]\s?(.*)$")
+# 独立日期行：整行只有一个日期时间（微信手机备份的换行格式块起点）
+DATETIME_LINE_RE = re.compile(rf"^{_DT}\s*$")
 
 
 @dataclass
@@ -51,10 +67,14 @@ class ChatDoc:
 
 
 def _parse_dt(s: str) -> datetime | None:
-    """解析日期时间（兼容有无秒）"""
+    """解析日期时间（兼容有无秒、中英文日期、-/ /. 分隔符）"""
+    t = s.strip()
+    # 中文日期 2024年01月01日 10:00[:ss] → 2024-01-01 10:00[:ss]，分隔符统一为 -
+    t = re.sub(r"年|月", "-", t).replace("日", "")
+    t = re.sub(r"[/.]", "-", t)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(s.strip(), fmt)
+            return datetime.strptime(t, fmt)
         except ValueError:
             continue
     return None
@@ -131,8 +151,66 @@ def _parse_general(text: str) -> list[Message]:
     return msgs
 
 
+def _looks_like_nick(line: str) -> bool:
+    """疑似发言人昵称：短、无冒号、无句末标点（用于区分块内的昵称行与内容行）"""
+    s = line.strip()
+    if not s or len(s) > 30:
+        return False
+    if any(ch in s for ch in ":：，。！？!?；;、"):
+        return False
+    return True
+
+
+def _parse_multiline(text: str) -> list[Message]:
+    """换行格式（微信手机备份）：日期时间独占一行，发言人与内容分行。
+
+    每个日期行开启一个消息块，块内（到下一个日期行为止）自适应两种排布：
+    - 昵称在内容前（留痕/微信官方）：日期行 → 昵称行 → 内容行（可多行）
+    - 昵称在内容后（用户样例）：日期行 → 内容行 → 空行 → 昵称行
+    仅一行内容时归为匿名消息（sender=""）。
+    """
+    msgs: list[Message] = []
+    lines = text.replace("\r\n", "\n").split("\n")
+    cur_dt: datetime | None = None
+    block: list[str] = []
+
+    def _flush() -> None:
+        if cur_dt is None:
+            return
+        non_empty = [ln for ln in block if ln.strip()]
+        if not non_empty:
+            return
+        sender, content = "", non_empty
+        # W2（昵称在后，用户样例式）：最后一个非空行像昵称，且它的前一行是空行
+        last = non_empty[-1].strip()
+        last_prev_blank = False
+        idx = len(block) - 1
+        while idx >= 0 and not block[idx].strip():
+            idx -= 1
+        if idx >= 1 and not block[idx - 1].strip():
+            last_prev_blank = True
+        if idx >= 0 and last_prev_blank and _looks_like_nick(last):
+            sender, content = last, non_empty[:-1]
+        # W1（昵称在前，留痕式）：日期行后紧跟昵称行，后面是内容
+        elif block[0].strip() and _looks_like_nick(block[0].strip()) and len(non_empty) >= 2:
+            sender, content = block[0].strip(), non_empty[1:]
+        msgs.append(Message(cur_dt, sender, "\n".join(content).strip()))
+
+    for line in lines:
+        stripped = line.strip()
+        if DATETIME_LINE_RE.match(stripped):
+            _flush()
+            cur_dt = _parse_dt(stripped)
+            block = []
+        elif cur_dt is not None:
+            block.append(line)
+    _flush()
+    return msgs
+
+
 _PARSERS = {
     "wechat": _parse_wechat,
+    "multiline": _parse_multiline,
     "feishu": _parse_feishu,
     "general": _parse_general,
 }
