@@ -39,10 +39,18 @@ export interface AnswerEvaluation {
   hallucination_risk: string
 }
 
-/** 引用来源文档（含 doc_id，可点击查看） */
+/** 引用来源文档（含 doc_id，可点击查看；附命中页码与原图） */
 export interface SourceRef {
   doc_id: number
   doc_title: string
+  /** 命中页码列表（纯文本文档为空数组） */
+  pages?: number[]
+  /** 命中块内原图 */
+  images?: {
+    id: number
+    url: string
+    page: number | null
+  }[]
 }
 
 /** 四段总结卡片结构 */

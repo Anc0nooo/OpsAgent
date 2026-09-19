@@ -13,6 +13,7 @@ import DOMPurify from 'dompurify'
 import { getHealth, type HealthInfo } from '../api'
 import { getSettingsStatus, type SettingsStatus } from '../api/settings'
 import { exportFile, loadSession, saveSessionKnowledge, streamChat, type AnswerEvaluation, type PendingQuery, type SourceRef, type SummarySections } from '../api/chat'
+import { kbImageUrl } from '../api/knowledge'
 import DocViewDialog from '../components/DocViewDialog.vue'
 
 /** 消息结构 */
@@ -55,6 +56,29 @@ const viewerVisible = ref(false)
 function openSource(s: SourceRef) {
   viewerDocId.value = s.doc_id
   viewerVisible.value = true
+}
+
+/** 来源页码文案：第X页 / 第X-Y页 */
+function sourcePageText(s: SourceRef): string {
+  const pages = s.pages || []
+  if (!pages.length) return ''
+  return pages.length === 1 ? `第${pages[0]}页` : `第${pages[0]}-${pages[pages.length - 1]}页`
+}
+
+/** 汇总一条消息所有来源里的原图（去重） */
+function sourceImages(sources?: SourceRef[]): { id: number; url: string; page: number | null }[] {
+  const out: { id: number; url: string; page: number | null }[] = []
+  for (const s of sources || []) {
+    for (const im of s.images || []) {
+      if (!out.some((x) => x.id === im.id)) out.push(im)
+    }
+  }
+  return out
+}
+
+/** 新窗口查看知识库原图 */
+function openKbImage(url: string) {
+  window.open(kbImageUrl(url), '_blank')
 }
 
 // DOM 引用：消息滚动容器 / 输入框
@@ -504,7 +528,21 @@ watch(() => messages.value.length, scrollToBottom)
                   :key="s.doc_id"
                   class="source-link"
                   @click="openSource(s)"
-                >{{ s.doc_title }}</a>
+                >📄 {{ s.doc_title }}<span v-if="sourcePageText(s)" class="source-page">（{{ sourcePageText(s) }}）</span></a>
+              </div>
+              <!-- 命中知识库原图回显 -->
+              <div
+                v-if="sourceImages(m.sources).length && !m.streaming"
+                class="source-images"
+              >
+                <img
+                  v-for="im in sourceImages(m.sources)"
+                  :key="im.id"
+                  :src="kbImageUrl(im.url)"
+                  :title="im.page ? `第${im.page}页原图，点击查看` : '原图，点击查看'"
+                  loading="lazy"
+                  @click="openKbImage(im.url)"
+                />
               </div>
             </div>
           </div>
@@ -1179,6 +1217,30 @@ watch(() => messages.value.length, scrollToBottom)
 }
 .source-link:hover {
   text-decoration: underline;
+}
+.source-page {
+  color: var(--text-sub);
+}
+/* 知识库命中原图 */
+.source-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.source-images img {
+  height: 110px;
+  max-width: 180px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: zoom-in;
+  background: var(--bg);
+  transition: transform 0.15s;
+}
+.source-images img:hover {
+  transform: scale(1.03);
+  border-color: var(--primary);
 }
 .send-btn.enabled:hover {
   filter: brightness(1.08);

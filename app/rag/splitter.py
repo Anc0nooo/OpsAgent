@@ -18,6 +18,8 @@ RAG 知识库 - 语义分块器（对应 FR-RAG-02，支持按文档类型差异
 """
 import re
 
+from app.config.settings import settings
+
 # markdown 标题行
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 # 代码块围栏（```sql / ```bash 等）
@@ -271,3 +273,210 @@ def split_document(text: str, max_chars: int = 600, overlap: int = 150,
                     if p.strip():
                         chunks.append({"text": p.strip(), "section": section})
     return chunks
+
+
+# ======================================================================
+# 结构化切分（document_loader.ParsedDocument 的 Block 列表）
+# 模式A（语义，不用 chunk_size）：schema 一表一块 / medical 段落切分
+# 模式B（用户可调 chunk_size）：guide / bug / other 递归切分 + overlap
+# ======================================================================
+def _mk_chunk(text: str, section: str, blocks: list | tuple) -> dict:
+    """从贡献块列表组装带位置元数据的 chunk（page 取首页，images 去重合并）"""
+    text = text.strip()
+    first = blocks[0]
+    page = getattr(first, "page", None)
+    header = getattr(first, "header", "") or ""
+    footer = getattr(first, "footer", "") or ""
+    imgs: list[dict] = []
+    seen = set()
+    for b in blocks:
+        for im in getattr(b, "images", []) or []:
+            k = im.get("id") or im.get("key")
+            if k in seen:
+                continue
+            seen.add(k)
+            imgs.append(im)
+    return {"text": text, "section": section, "page": page,
+            "header": header, "footer": footer, "images": imgs}
+
+
+def _split_schema_semantic(blocks: list) -> list[dict]:
+    """模式A-表结构：一张表（或一段 DDL）为最小完整单位，绝不切散字段列表"""
+    chunks: list[dict] = []
+    section = ""
+    buffer: list = []   # 表格前的标题/短说明（表名、表注释）
+
+    def flush_buffer() -> None:
+        if buffer:
+            chunks.append(_mk_chunk("\n\n".join(b.text for b in buffer), section, buffer))
+            buffer.clear()
+
+    for b in blocks:
+        if b.kind == "heading":
+            flush_buffer()
+            section = b.text
+            buffer = [b]
+        elif b.kind == "table":
+            # 表名/标题/说明 + 整张表 = 一个块
+            merged = buffer + [b]
+            chunks.append(_mk_chunk(
+                ("\n\n".join(x.text for x in merged)), section, merged))
+            buffer.clear()
+        else:
+            # 含 CREATE TABLE 的 DDL 段同样整体保留
+            is_ddl = "CREATE TABLE" in b.text.upper() or b.text.lstrip().startswith("```")
+            if is_ddl:
+                merged = buffer + [b]
+                chunks.append(_mk_chunk("\n\n".join(x.text for x in merged), section, merged))
+                buffer.clear()
+            else:
+                buffer.append(b)
+                # 兜底：连续说明文字过长先落一块（实际表结构文档几乎不会触发）
+                if sum(len(x.text) for x in buffer) > settings.MEDICAL_LONG_PARAGRAPH:
+                    flush_buffer()
+    flush_buffer()
+    return chunks
+
+
+def _split_medical_semantic(blocks: list) -> list[dict]:
+    """模式A-医疗文件：按段落切；段落 >2000 字按句子边界二次切；表格整块。
+
+    表格与其前文（章节标题 + 标题后紧邻的短说明，每条 ≤150 字）合为一块，
+    避免表格脱离表名/注释；长说明段落自成一块、不并入表格。
+    """
+    chunks: list[dict] = []
+    section = ""
+    heading_block = None   # 最近标题块
+    notes: list = []       # 标题后紧邻的短说明（表格上文候选）
+    for b in blocks:
+        if b.kind == "heading":
+            section = b.text
+            heading_block = b
+            notes = []
+            continue
+        if b.kind == "table":
+            merged = ([heading_block] if heading_block else []) + notes + [b]
+            chunks.append(_mk_chunk("\n\n".join(x.text for x in merged), section, merged))
+            heading_block = None
+            notes = []
+            continue
+        # 段落（含 OCR 段）：过长按句子边界二次切，但不做 overlap、不从句中硬切
+        if len(b.text) > settings.MEDICAL_LONG_PARAGRAPH:
+            parts = _recursive_split(
+                b.text, settings.MEDICAL_LONG_PARAGRAPH,
+                ["\n", "。", "！", "？", "；", "，", "、", " ", ""],
+            )
+            for p in parts:
+                chunks.append(_mk_chunk(p, section, [b]))
+            notes = []
+        else:
+            chunks.append(_mk_chunk(b.text, section, [b]))
+            if len(b.text) <= 150:
+                notes.append(b)
+            else:
+                notes = []
+    return chunks
+
+
+def _split_run_with_meta(blocks: list, section: str,
+                         chunk_size: int, overlap: int) -> list[dict]:
+    """模式B：把一段连续正文块按 chunk_size 递归切分 + overlap，并保留页码/图片映射"""
+    if not blocks:
+        return []
+    # 拼全文并记录每块字符区间（用于把切好的 piece 映射回 block 的位置/图片）
+    full = ""
+    spans: list[tuple[int, int, object]] = []
+    for b in blocks:
+        start = len(full)
+        seg = b.text if not full else "\n\n" + b.text
+        full += seg
+        spans.append((start, len(full), b))  # start=追加前长度，恰为本块起点
+
+    raw_pieces = _recursive_split(full, chunk_size, _SEPARATORS)
+    final_texts = _with_overlap(raw_pieces, overlap)
+
+    chunks: list[dict] = []
+    cursor = 0
+    for i, piece in enumerate(raw_pieces):
+        head = piece[:30]
+        try:
+            s = full.index(head, cursor)
+        except ValueError:
+            s = cursor
+        e = min(s + len(piece), len(full))
+        cursor = max(cursor, s)
+        contrib = [b for (bs, be, b) in spans if be > s and bs < e]
+        if not contrib:
+            contrib = blocks[:1]
+        chunks.append(_mk_chunk(final_texts[i], section, contrib))
+    return chunks
+
+
+def _split_mode_b(blocks: list, chunk_size: int, overlap: int) -> list[dict]:
+    """模式B：guide/bug/other —— 标题分区，正文按用户参数切，表格按行分批不拆行"""
+    chunks: list[dict] = []
+    section = ""
+    run: list = []
+
+    def flush_run() -> None:
+        if run:
+            chunks.extend(_split_run_with_meta(run, section, chunk_size, overlap))
+            run.clear()
+
+    for b in blocks:
+        if b.kind == "heading":
+            flush_run()
+            section = b.text
+            # 标题作为新 run 的起始上下文（随首块一起进正文）
+            run = [b]
+        elif b.kind == "table":
+            flush_run()
+            # 表格 ≤2*chunk_size 整块保留；超过按行分批，每批重复表头
+            for part in _split_table(b.text, batch_size=chunk_size,
+                                     keep_whole_cap=chunk_size * 2):
+                chunks.append(_mk_chunk(part, section, [b]))
+        else:
+            # 单块超长先在块内递归切，避免跨页内容被错误并到同一 piece
+            if len(b.text) > chunk_size:
+                sub_parts = _recursive_split(b.text, chunk_size, _SEPARATORS)
+                # 图片只随首片，其余分片不重复携带
+                pseudo = [
+                    _pseudo_block(p, b, carry_images=(i == 0))
+                    for i, p in enumerate(sub_parts)
+                ]
+                if run:
+                    # 已累积的标题/短块不要单独成碎块：文本与图片并入首片
+                    first = pseudo[0]
+                    first.text = "\n\n".join(x.text for x in [*run, first] if x.text)
+                    for x in run:
+                        for im in getattr(x, "images", []) or []:
+                            if im not in first.images:
+                                first.images.append(im)
+                    run.clear()
+                chunks.extend(_split_run_with_meta(pseudo, section, chunk_size, overlap))
+            else:
+                run.append(b)
+    flush_run()
+    return chunks
+
+
+def _pseudo_block(text: str, ref: object, carry_images: bool = False) -> object:
+    """块内二次切分后的虚拟块：继承原块页码/页眉页脚；图片仅首片携带"""
+    from app.rag.document_loader import Block
+    return Block(kind=ref.kind, text=text, page=getattr(ref, "page", None),
+                 images=getattr(ref, "images", []) if carry_images else [],
+                 header=getattr(ref, "header", ""), footer=getattr(ref, "footer", ""))
+
+
+def split_structured(blocks: list, doc_type: str,
+                     chunk_size: int, overlap: int) -> list[dict]:
+    """
+    结构化块 → chunk dict（含 text/section/page/header/footer/images）。
+    - schema / medical：模式A 语义切分（忽略 chunk_size/overlap）；
+    - guide / bug / other：模式B，chunk_size/overlap 由每用户设置决定。
+    """
+    if doc_type == "schema":
+        return _split_schema_semantic(blocks)
+    if doc_type == "medical":
+        return _split_medical_semantic(blocks)
+    return _split_mode_b(blocks, chunk_size, overlap)

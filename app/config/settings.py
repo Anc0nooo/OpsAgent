@@ -74,11 +74,38 @@ class Settings(BaseSettings):
         "other":  {"chunk_size": 500,  "chunk_overlap": 100, "whole_threshold": 700},   # 其他
     }
     CHUNK_DEFAULT_TYPE: str = "other"       # 未知 doc_type 时回退的分块档
+
+    # ---- 每用户可调切分参数（模式B：guide/bug/other）的取值范围与默认值 ----
+    KB_CHUNK_SIZE_DEFAULT: int = 500
+    KB_CHUNK_SIZE_MIN: int = 300
+    KB_CHUNK_SIZE_MAX: int = 1000
+    KB_OVERLAP_DEFAULT: int = 50
+    KB_OVERLAP_MIN: int = 0
+    KB_OVERLAP_MAX: int = 200
+    # 模式A（语义切分，不用 chunk_size）：医疗文件长段落二次切分上限
+    MEDICAL_LONG_PARAGRAPH: int = 2000
+
+    # ---- 图片 / OCR（PDF/Word 内嵌图片；qwen-vl 视觉模型，避免 2核2G 跑本地 OCR）----
+    OCR_ENABLED: bool = True                # False 时仅提取原图与位置，不调视觉模型
+    VISION_MODEL: str = "qwen-vl-plus"      # OCR 视觉模型（用用户配置的同一 API Key）
+    OCR_MAX_IMAGES_PER_DOC: int = 20        # 单篇文档 OCR 图片数上限（控成本/控时长）
+    OCR_MIN_IMAGE_PX: int = 64              # 过小图片（图标）跳过 OCR
+    SCANNED_PAGE_MIN_CHARS: int = 30        # 页文本少于该值视为扫描件，整页渲染走 OCR
+
+    # ---- 图片与解析缓存目录（DATA_DIR 下）----
+    # data/images/user_{id}/doc_{id}/xxx.png；data/parsed_cache/{doc_id}.json
+    @property
+    def IMAGES_DIR(self):  # noqa: N802 - 保持配置项风格
+        return self.DATA_DIR / "images"
+
+    @property
+    def PARSED_CACHE_DIR(self):  # noqa: N802
+        return self.DATA_DIR / "parsed_cache"
     RAG_NEIGHBOR_WINDOW: int = 1             # 检索后同文档相邻块合并窗口（命中块 seq±N 合并为一个片段）
     RETRIEVAL_TOP_N: int = 10                # 混合召回候选数（送重排前）
     BM25_WEIGHT: float = 0.5                 # BM25 融合权重
     VECTOR_WEIGHT: float = 0.5               # 向量融合权重
-    EMBED_BATCH_SIZE: int = 10               # 向量化单批上限（百炼限制）
+    EMBED_BATCH_SIZE: int = 16               # 向量化单批上限（百炼 text-embedding-v3 单批 25 条，16 留余量）
 
     # ---- 会话与查询约束 ----
     # 上下文保留最近"轮数"（1 轮 = 1 user + 1 assistant = 2 条消息）；

@@ -57,13 +57,27 @@ def build_history(db: Session, session_id: str, limit: int | None = None) -> str
     return "\n".join(lines)
 
 
+def _hit_location(hit: dict) -> str:
+    """命中片段的位置描述：第X页 / 第X-Y页（含页眉）；纯文本文档无页码返回空串"""
+    pages = hit.get("pages")
+    if not pages:
+        pages = [hit["page"]] if hit.get("page") else []
+    if not pages:
+        return ""
+    loc = f"，第{pages[0]}页" if len(pages) == 1 else f"，第{pages[0]}-{pages[-1]}页"
+    header = (hit.get("header") or "").strip()
+    if header:
+        loc += f"（页眉：{header[:40]}）"
+    return loc
+
+
 def _format_hit(hit: dict, max_len: int, index: int) -> str:
     """检索片段 → 注入文本块（超预算在句边界裁断，不硬切句子）"""
     text = _trim_at_boundary(hit.get("text", ""), max_len)
     merged = "，合并相邻片段" if hit.get("is_merged") else ""
     return (
         f"[{index}] 来源：{hit.get('doc_title', '')}｜{hit.get('section', '')}"
-        f"（类型：{hit.get('doc_type', '')}，相关度 {hit.get('score', '')}{merged}）\n{text}"
+        f"{_hit_location(hit)}（类型：{hit.get('doc_type', '')}，相关度 {hit.get('score', '')}{merged}）\n{text}"
     )
 
 
@@ -101,16 +115,30 @@ def _build_rag_text(segments: list[dict], schema_hits: list[dict]) -> str:
 
 
 def _collect_sources(segments: list[dict], schema_hits: list[dict]) -> list[dict]:
-    """从合并片段与表结构块去重收集来源文档（保序）"""
-    seen: set[int] = set()
-    sources: list[dict] = []
+    """从合并片段与表结构块收集来源文档（按 doc_id 去重保序），并聚合页码与原图"""
+    grouped: dict[int, dict] = {}
+    order: list[int] = []
     for h in [*segments, *schema_hits]:
         did = h.get("doc_id")
-        if did is None or did in seen:
+        if did is None:
             continue
-        seen.add(did)
-        sources.append({"doc_id": did, "doc_title": h.get("doc_title", "")})
-    return sources
+        if did not in grouped:
+            grouped[did] = {
+                "doc_id": did, "doc_title": h.get("doc_title", ""),
+                "pages": [], "images": [],
+            }
+            order.append(did)
+        g = grouped[did]
+        pages = h.get("pages") or ([h.get("page")] if h.get("page") else [])
+        for p in pages:
+            if p not in g["pages"]:
+                g["pages"].append(p)
+        for im in h.get("images") or []:
+            if not any(x.get("id") == im.get("id") for x in g["images"]):
+                g["images"].append(im)
+    for g in grouped.values():
+        g["pages"].sort()
+    return [grouped[d] for d in order]
 
 
 def build_rag_context(db: Session, user_id: int, query: str) -> str:

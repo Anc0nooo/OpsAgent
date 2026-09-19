@@ -65,6 +65,21 @@ def _migrate_schema() -> None:
                 conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'"))
             logger.info("users 表已补充 role 列")
 
+    # knowledge_chunks 补位置元数据列（结构化解析：页码/页眉/页脚/图片）
+    if "knowledge_chunks" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("knowledge_chunks")}
+        add_cols = [
+            ("page", "INTEGER NULL"),
+            ("header", "VARCHAR(255) NULL"),
+            ("footer", "VARCHAR(255) NULL"),
+            ("images", "TEXT NULL"),
+        ]
+        with engine.begin() as conn:
+            for name, ddl in add_cols:
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE knowledge_chunks ADD COLUMN {name} {ddl}"))
+                    logger.info("knowledge_chunks 表已补充 %s 列", name)
+
     # 迁移后：如果没有 ancon 角色，把第一个用户（最小 ID）设为 ancon
     with engine.begin() as conn:
         result = conn.execute(text("SELECT COUNT(*) FROM users WHERE role = 'ancon'")).scalar()

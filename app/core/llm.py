@@ -202,6 +202,41 @@ class LLMClient:
         raise LLMApiError(f"structured_output 调用失败: {last_err}", error_code=_classify_error(last_err)) from last_err
 
     # ------------------------------------------------------------------
+    # 视觉 OCR（qwen-vl；用于 PDF/Word 图片与扫描件识别，避免本地跑 OCR）
+    # ------------------------------------------------------------------
+    def vision_ocr(self, image_bytes: bytes, mime: str = "image/png") -> str:
+        """对单张图片做 OCR，返回识别文字；图片无文字时返回空串，失败抛 LLMApiError"""
+        import base64
+
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": (
+                    "请识别图片中的全部文字，按原文排版输出纯文本，不要解释、不要加开场白。"
+                    "如果是表格，输出 Markdown 表格；如果图片中没有文字，只输出 NO_TEXT。"
+                )},
+            ],
+        }]
+        last_err: Exception | None = None
+        for attempt in range(settings.LLM_MAX_RETRIES + 1):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=settings.VISION_MODEL, messages=messages, temperature=0.0,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                if text.upper().startswith("NO_TEXT"):
+                    return ""
+                return text
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < settings.LLM_MAX_RETRIES:
+                    time.sleep(self._retry_delay(attempt))
+        raise LLMApiError(f"vision_ocr 调用失败: {last_err}", error_code=_classify_error(last_err)) from last_err
+
+    # ------------------------------------------------------------------
     # 向量化
     # ------------------------------------------------------------------
     def embed(self, texts: list[str]) -> list[list[float]]:

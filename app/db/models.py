@@ -61,7 +61,7 @@ class KnowledgeDoc(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title = Column(String(255), nullable=False)
-    doc_type = Column(String(20), nullable=False, default="other")  # guide/bug/schema/other
+    doc_type = Column(String(20), nullable=False, default="other")  # guide/bug/schema/medical/other
     source = Column(String(255), nullable=False, default="")
     chunk_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
@@ -83,10 +83,45 @@ class KnowledgeChunk(Base):
     section = Column(String(255), nullable=False, default="")
     text = Column(Text, nullable=False)
     doc_type = Column(String(20), nullable=False)
+    # ---- 位置元数据（PDF/Word 结构化解析；纯文本入库为 NULL）----
+    page = Column(Integer, nullable=True)        # 起始页码（从 1 开始）
+    header = Column(String(255), nullable=True)  # 所在页页眉
+    footer = Column(String(255), nullable=True)  # 所在页页脚
+    images = Column(Text, nullable=True)         # JSON: [{id, page, ocr_text(截断)}]，原图见 kb_images
     created_at = Column(DateTime, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
     __table_args__ = (
         Index("idx_chunk_doc", "doc_id"),
+    )
+
+
+class UserKbSettings(Base):
+    """每用户知识库切分参数（仅模式B文档 guide/bug/other 生效；schema/medical 走语义切分）"""
+    __tablename__ = "user_kb_settings"
+
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    chunk_size = Column(Integer, nullable=False, default=500)      # 300~1000
+    chunk_overlap = Column(Integer, nullable=False, default=50)    # 0~200
+    updated_at = Column(DateTime, nullable=False,
+                        server_default=sa_text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
+
+
+class KbImage(Base):
+    """知识库原图（PDF/Word 内嵌图片提取后落盘，按用户隔离；检索命中时回显）"""
+    __tablename__ = "kb_images"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    doc_id = Column(BigInteger, ForeignKey("knowledge_docs.id", ondelete="CASCADE"), nullable=False)
+    page = Column(Integer, nullable=True)                # 页码（Word 可空）
+    bbox = Column(String(100), nullable=True)           # 页面坐标 x0,y0,x1,y1（调试用）
+    path = Column(String(500), nullable=False)           # 相对 DATA_DIR 的存储路径
+    ocr_text = Column(Text, nullable=True)               # OCR 识别文字（无文字/失败为 NULL）
+    created_at = Column(DateTime, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
+
+    __table_args__ = (
+        Index("idx_img_doc", "doc_id"),
+        Index("idx_img_user", "user_id"),
     )
 
 

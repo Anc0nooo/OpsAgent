@@ -6,11 +6,13 @@ RAG 知识库 - 数据访问层（MySQL + SQLAlchemy，多用户隔离）
 所有函数接受 db: Session 参数（由 API 层 get_db 依赖注入），
 文档相关操作同时校验 user_id 防止越权。
 """
+import json
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.db.models import KnowledgeChunk, KnowledgeDoc
+from app.db.models import KnowledgeChunk, KnowledgeDoc, KbImage, UserKbSettings
 
 
 # ----------------------------------------------------------------------
@@ -48,12 +50,28 @@ def update_doc_meta(
     return True
 
 
+def _chunk_row_to_dict(r: KnowledgeChunk) -> dict[str, Any]:
+    """块 ORM 行 → dict（含位置元数据；images JSON 反序列化）"""
+    images: list[Any] = []
+    if r.images:
+        try:
+            images = json.loads(r.images)
+        except (ValueError, TypeError):
+            images = []
+    return {
+        "id": r.id, "seq": r.seq, "section": r.section, "text": r.text,
+        "doc_type": r.doc_type, "doc_id": r.doc_id,
+        "page": r.page, "header": r.header or "", "footer": r.footer or "",
+        "images": images,
+    }
+
+
 def get_doc_chunks(db: Session, doc_id: int) -> list[dict[str, Any]]:
-    """按 seq 顺序返回某文档全部块（含 id/section/text），供在线查看与编辑"""
+    """按 seq 顺序返回某文档全部块（含位置/图片元数据），供在线查看、重建与相邻合并"""
     rows = db.query(KnowledgeChunk).filter(
         KnowledgeChunk.doc_id == doc_id
     ).order_by(KnowledgeChunk.seq).all()
-    return [{"id": r.id, "seq": r.seq, "section": r.section, "text": r.text} for r in rows]
+    return [_chunk_row_to_dict(r) for r in rows]
 
 
 def update_doc_type_only(db: Session, doc_id: int, user_id: int, doc_type: str) -> int:
@@ -127,7 +145,7 @@ def insert_chunks(
 ) -> list[str]:
     """
     批量写入块记录。
-    chunks: [{"text":..., "section":...}, ...]
+    chunks: [{"text", "section", "page", "header", "footer", "images": [...]}, ...]
     start_seq: 起始序号（增量追加时接续已有块序号，避免覆盖）
     返回块 id 列表（与输入顺序一致）
     """
@@ -135,9 +153,14 @@ def insert_chunks(
     for i, ch in enumerate(chunks):
         seq = start_seq + i
         cid = f"{doc_id}_{seq}"
+        imgs = ch.get("images")
         chunk = KnowledgeChunk(
             id=cid, doc_id=doc_id, seq=seq,
             section=ch.get("section", ""), text=ch["text"], doc_type=doc_type,
+            page=ch.get("page"),
+            header=((ch.get("header") or "")[:250] or None),
+            footer=((ch.get("footer") or "")[:250] or None),
+            images=json.dumps(imgs, ensure_ascii=False) if imgs else None,
         )
         db.add(chunk)
         ids.append(cid)
@@ -170,10 +193,7 @@ def all_chunks(db: Session, user_id: int) -> list[dict[str, Any]]:
     ).filter(
         KnowledgeDoc.user_id == user_id
     ).order_by(KnowledgeChunk.doc_id, KnowledgeChunk.seq).all()
-    return [{
-        "id": r.id, "doc_id": r.doc_id, "seq": r.seq,
-        "section": r.section, "text": r.text, "doc_type": r.doc_type,
-    } for r in rows]
+    return [_chunk_row_to_dict(r) for r in rows]
 
 
 def migrate_doc_types(db: Session, user_id: int, legacy_map: dict[str, str]) -> int:
@@ -193,3 +213,76 @@ def migrate_doc_types(db: Session, user_id: int, legacy_map: dict[str, str]) -> 
         total += int(chunks)
     db.flush()
     return total
+
+
+# ----------------------------------------------------------------------
+# user_kb_settings 操作（每用户切分参数，模式B文档生效）
+# ----------------------------------------------------------------------
+DEFAULT_CHUNK_SIZE = 500
+DEFAULT_CHUNK_OVERLAP = 50
+
+
+def get_kb_settings(db: Session, user_id: int) -> dict[str, int]:
+    """读取用户切分参数；未设置时返回默认值（500/50），不自动落库"""
+    row = db.query(UserKbSettings).filter(UserKbSettings.user_id == user_id).first()
+    if row is None:
+        return {"chunk_size": DEFAULT_CHUNK_SIZE, "chunk_overlap": DEFAULT_CHUNK_OVERLAP}
+    return {"chunk_size": int(row.chunk_size), "chunk_overlap": int(row.chunk_overlap)}
+
+
+def upsert_kb_settings(db: Session, user_id: int, chunk_size: int, chunk_overlap: int) -> dict[str, int]:
+    """保存用户切分参数（不存在则插入），参数越界由调用方校验"""
+    row = db.query(UserKbSettings).filter(UserKbSettings.user_id == user_id).first()
+    if row is None:
+        row = UserKbSettings(user_id=user_id, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        db.add(row)
+    else:
+        row.chunk_size = chunk_size
+        row.chunk_overlap = chunk_overlap
+    db.flush()
+    return {"chunk_size": int(row.chunk_size), "chunk_overlap": int(row.chunk_overlap)}
+
+
+# ----------------------------------------------------------------------
+# kb_images 操作（知识库原图）
+# ----------------------------------------------------------------------
+def insert_image(db: Session, user_id: int, doc_id: int, path: str,
+                 page: int | None, bbox: str, ocr_text: str | None) -> int:
+    """写入图片记录，返回 image_id（原图文件已由调用方落盘）"""
+    row = KbImage(
+        user_id=user_id, doc_id=doc_id, page=page,
+        bbox=(bbox or None), path=path, ocr_text=(ocr_text or None),
+    )
+    db.add(row)
+    db.flush()
+    return int(row.id)
+
+
+def get_image(db: Session, image_id: int) -> dict[str, Any] | None:
+    """按 id 查图片记录（不校验归属；接口层用 user_id 校验）"""
+    row = db.query(KbImage).filter(KbImage.id == image_id).first()
+    if row is None:
+        return None
+    return {
+        "id": row.id, "user_id": row.user_id, "doc_id": row.doc_id,
+        "page": row.page, "path": row.path, "ocr_text": row.ocr_text or "",
+    }
+
+
+def list_doc_images(db: Session, doc_id: int) -> list[dict[str, Any]]:
+    """某文档全部图片（重建索引时复用，OCR 不重跑）"""
+    rows = db.query(KbImage).filter(KbImage.doc_id == doc_id).order_by(KbImage.id).all()
+    return [{
+        "id": r.id, "user_id": r.user_id, "doc_id": r.doc_id, "page": r.page,
+        "bbox": r.bbox or "", "path": r.path, "ocr_text": r.ocr_text or "",
+    } for r in rows]
+
+
+def delete_images_by_doc(db: Session, doc_id: int) -> list[str]:
+    """删除某文档图片记录，返回文件相对路径列表（调用方负责删盘）"""
+    rows = db.query(KbImage).filter(KbImage.doc_id == doc_id).all()
+    paths = [r.path for r in rows]
+    for r in rows:
+        db.delete(r)
+    db.flush()
+    return paths

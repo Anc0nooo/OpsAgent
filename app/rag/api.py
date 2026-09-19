@@ -6,23 +6,33 @@ RAG 知识库 - API 路由（多用户：所有接口需登录，按 user_id 隔
 - POST /api/knowledge/table_schema  批量导入表结构（DESC 输出或 DDL）
 - GET  /api/knowledge/docs          文档列表（当前用户）
 - DELETE /api/knowledge/docs/{id}   删除文档（校验归属）
+- GET  /api/knowledge/settings      每用户切分参数（chunk_size/overlap）
+- PUT  /api/knowledge/settings      保存切分参数（改后需重建索引）
+- GET  /api/knowledge/image/{id}    知识库原图回显（支持 ?token= 鉴权）
 - POST /api/knowledge/search        混合检索（BM25+向量+重排，返回 top-5 与来源）
+- GET  /api/knowledge/progress      查询入库/重建进度（前端轮询）
 - POST /api/knowledge/test          检索效果测试（批量问题输出命中与 top-5）
 """
+import asyncio
 import logging
 
 import chromadb
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.responses import FileResponse
 import pymupdf  # PyMuPDF
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, security
+from app.auth.jwt import decode_token
 from app.auth.log import log_operation
+from app.config.settings import settings
 from app.db.engine import get_db
 from app.db.models import User
 from app.models.common import fail, ok
-from app.rag.service import ALLOWED_TYPES, knowledge_service
+from app.rag import db as rag_db
+from app.rag.service import ALLOWED_TYPES, knowledge_service, set_progress, get_progress
 
 logger = logging.getLogger(__name__)
 
@@ -104,39 +114,50 @@ async def upload_doc(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    """上传文档入库（txt/md/sql/pdf/docx），支持增量追加"""
+    """上传文档入库（txt/md/sql/pdf/docx），支持增量追加。
+
+    PDF/Word 走结构化解析：表格转 Markdown、内嵌图片提取落盘 + qwen-vl OCR、
+    页眉页脚/页码写入块元数据；txt/md/sql 走纯文本解析。
+    """
     if doc_type not in ALLOWED_TYPES:
         return fail(400, f"不支持的文档类型: {doc_type}，可选: {ALLOWED_TYPES}")
     data = await file.read()
+    uid = user.id
+    # 进度回调（供 GET /progress 轮询）
+    def _progress(done, total):
+        set_progress(uid, status="processing", phase="embedding",
+                     done=done, total=total,
+                     detail=f"向量化 {done}/{total}")
+    set_progress(uid, status="processing", phase="parsing",
+                 done=0, total=0, detail="解析文档中…")
     try:
-        if file.filename and file.filename.lower().endswith(".docx"):
-            text = read_docx_text(data)
-        else:
-            text = read_file_text(file.filename or "", data)
-    except ValueError as e:
-        return fail(400, str(e))
-
-    doc_id: int | None = None
-    try:
-        doc_id = knowledge_service.add_document(
-            db, user.id,
-            title=title or file.filename or "未命名文档",
-            text=text,
-            doc_type=doc_type,
-            source=f"upload:{file.filename}",
-            doc_id=append_doc_id,
-            append=append_doc_id is not None,
+        loop = asyncio.get_event_loop()
+        doc_id: int | None = await loop.run_in_executor(
+            None,
+            lambda: knowledge_service.ingest_file(
+                db, uid,
+                title=title or file.filename or "未命名文档",
+                filename=file.filename or "",
+                data=data,
+                doc_type=doc_type,
+                append_doc_id=append_doc_id,
+                progress_cb=_progress,
+            ),
         )
         db.commit()
-        log_operation(db, user.id, "upload_doc",
+        log_operation(db, uid, "upload_doc",
                       f"上传文档《{title or file.filename}》(id={doc_id})",
                       request, username=user.username)
+        set_progress(uid, status="done", detail="入库成功")
         return ok({"doc_id": doc_id, "message": "入库成功"})
+    except ValueError as e:
+        set_progress(uid, status="error", detail=str(e))
+        return fail(400, str(e))
     except chromadb.errors.InternalError:
         # Chroma HNSW 索引损坏：本次写入已回滚，自动修复后提示重新上传
         logger.exception("上传触发 Chroma 索引损坏")
         try:
-            knowledge_service.repair_index(db, user.id)
+            knowledge_service.repair_index(db, uid)
             db.commit()
         except Exception as repair_err:  # noqa: BLE001
             logger.exception("Chroma 自动修复失败")
@@ -148,6 +169,7 @@ async def upload_doc(
         return fail(500, "知识库索引损坏，已自动修复，请重新上传")
     except Exception as e:  # noqa: BLE001
         logger.exception("上传入库失败")
+        set_progress(uid, status="error", detail=f"入库失败: {e}")
         return fail(500, f"入库失败: {e}")
 
 
@@ -353,10 +375,73 @@ def change_doc_type(doc_id: int, body: DocTypeIn, db: Session = Depends(get_db),
         return fail(500, f"切换失败: {e}")
 
 
+# ----------------------------------------------------------------------
+# 切分参数（每用户可调，仅模式B：guide/bug/other 生效）
+# ----------------------------------------------------------------------
+class KbSettingsIn(BaseModel):
+    """切分参数设置（范围由后端强校验）"""
+    chunk_size: int = Field(..., ge=300, le=1000)
+    chunk_overlap: int = Field(..., ge=0, le=200)
+
+
+@router.get("/settings")
+def get_settings(db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)) -> dict:
+    """读取当前用户的切分参数（未设置过返回默认 500/50）"""
+    return ok(rag_db.get_kb_settings(db, user.id))
+
+
+@router.put("/settings")
+def save_settings(body: KbSettingsIn, request: Request, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)) -> dict:
+    """保存当前用户的切分参数（修改后需重建索引才对存量文档生效）"""
+    saved = rag_db.upsert_kb_settings(db, user.id, body.chunk_size, body.chunk_overlap)
+    db.commit()
+    log_operation(db, user.id, "kb_settings_save",
+                  f"切分参数 chunk_size={saved['chunk_size']} overlap={saved['chunk_overlap']}",
+                  request, username=user.username)
+    return ok({**saved, "message": "已保存，修改后需重建索引生效"})
+
+
+# ----------------------------------------------------------------------
+# 知识库原图回显（<img> 标签无法带 Authorization 头，允许 ?token= 鉴权）
+# ----------------------------------------------------------------------
+def get_image_user(
+    token: str = Query("", description="img 标签场景的 query token"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    """图片接口鉴权：Bearer 头优先，回退 query 参数 token"""
+    raw = credentials.credentials if credentials and credentials.credentials else token
+    if not raw:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期，请重新登录")
+    payload = decode_token(raw)
+    user_id = (payload or {}).get("user_id")
+    user = db.query(User).filter(User.id == user_id).first() if user_id is not None else None
+    if user is None:
+        raise HTTPException(status_code=401, detail="Token 无效或已过期，请重新登录")
+    if user.status != 1:
+        raise HTTPException(status_code=403, detail="账号已被禁用")
+    return user
+
+
+@router.get("/image/{image_id}")
+def get_kb_image(image_id: int, db: Session = Depends(get_db),
+                 user: User = Depends(get_image_user)) -> FileResponse:
+    """回显知识库原图（校验图片归属当前用户）"""
+    im = rag_db.get_image(db, image_id)
+    if im is None or im["user_id"] != user.id:
+        raise HTTPException(status_code=404, detail="图片不存在或无权访问")
+    path = settings.DATA_DIR / im["path"]
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="图片文件不存在或已被清理")
+    return FileResponse(path)
+
+
 @router.post("/search")
 def search(body: SearchIn, request: Request, db: Session = Depends(get_db),
            user: User = Depends(get_current_user)) -> dict:
-    """混合检索：BM25 + 向量 + gte-rerank，返回 top_k（默认5）"""
+    """混合检索：BM25 + 向量 + gte-rerank，返回 top_k（默认5，含页码/页眉/原图）"""
     try:
         results = knowledge_service.retrieve(db, user.id, body.query,
                                              doc_type=body.doc_type, top_k=body.top_k)
@@ -370,12 +455,22 @@ def search(body: SearchIn, request: Request, db: Session = Depends(get_db),
 
 
 @router.post("/reindex")
-def reindex(db: Session = Depends(get_db),
-            user: User = Depends(get_current_user)) -> dict:
+async def reindex(db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)) -> dict:
     """重建索引：按当前分块策略对当前用户全部文档重新切分 + 重新向量化（耗时操作）。"""
+    uid = user.id
+    def _progress(done, total):
+        set_progress(uid, status="processing", phase="embedding",
+                     done=done, total=total,
+                     detail=f"向量化 {done}/{total}")
+    set_progress(uid, status="processing", phase="rebuilding",
+                 done=0, total=0, detail="重建索引中…")
     try:
-        result = knowledge_service.rebuild_index(db, user.id)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: knowledge_service.rebuild_index(db, uid, progress_cb=_progress))
         db.commit()
+        set_progress(uid, status="done", detail=f"重建完成：{result['docs']} 篇文档，{result['chunks']} 个块")
         return ok({
             "docs": result["docs"],
             "chunks": result["chunks"],
@@ -384,7 +479,14 @@ def reindex(db: Session = Depends(get_db),
         })
     except Exception as e:  # noqa: BLE001
         logger.exception("重建索引失败")
+        set_progress(uid, status="error", detail=f"重建索引失败: {e}")
         return fail(500, f"重建索引失败: {e}")
+
+
+@router.get("/progress")
+def progress(user: User = Depends(get_current_user)) -> dict:
+    """查询当前用户入库/重建进度（前端轮询：status/phase/done/total/detail）"""
+    return ok(get_progress(user.id))
 
 
 @router.post("/test")
@@ -401,6 +503,7 @@ def retrieval_test(body: TestIn, db: Session = Depends(get_db),
                     "doc_title": r["doc_title"],
                     "section": r["section"],
                     "doc_type": r["doc_type"],
+                    "page": r.get("page"),
                     "score": r["score"],
                 }
                 for r in results

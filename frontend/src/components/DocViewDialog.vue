@@ -22,6 +22,7 @@ const DOC_TYPES = [
   { code: 'guide', label: '操作指导类' },
   { code: 'bug', label: 'BUG修复类' },
   { code: 'schema', label: '表结构类' },
+  { code: 'medical', label: '医疗文件类' },
   { code: 'other', label: '其他' },
 ] as const
 

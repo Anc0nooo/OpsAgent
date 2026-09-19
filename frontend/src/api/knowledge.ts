@@ -3,8 +3,29 @@
  * 对应后端 /api/knowledge/*
  */
 import { createAuthHttp } from './request'
+import { getToken } from './token'
 
 const http = createAuthHttp({ baseURL: '/api/knowledge', timeout: 60000 })
+
+/** 知识库原图引用（后端回传相对 URL，展示时用 kbImageUrl 拼 token） */
+export interface KbImageRef {
+  id: number
+  /** 相对路径 /api/knowledge/image/{id} */
+  url: string
+  page: number | null
+}
+
+/** 给图片接口 URL 附加鉴权 token（<img> 标签无法带 Authorization 头） */
+export function kbImageUrl(url: string): string {
+  const token = getToken()
+  return token ? `${url}?token=${encodeURIComponent(token)}` : url
+}
+
+/** 每用户切分参数（仅模式B文档 guide/bug/other 生效） */
+export interface KbSettings {
+  chunk_size: number
+  chunk_overlap: number
+}
 
 /** 文档信息 */
 export interface DocInfo {
@@ -24,6 +45,14 @@ export interface SearchHit {
   doc_type: string
   score: number
   text: string
+  /** 起始页码（PDF/Word；纯文本文档为 null） */
+  page?: number | null
+  /** 所在页页眉 */
+  header?: string
+  /** 所在页页脚 */
+  footer?: string
+  /** 命中块内原图 */
+  images?: KbImageRef[]
 }
 
 /** 文档详情（含全文，供在线查看/编辑） */
@@ -103,6 +132,33 @@ export async function searchDocs(query: string, docType?: string, topK = 5): Pro
 export async function reindex(): Promise<{ docs: number; chunks: number }> {
   const r = await http.post('/reindex', {}, { timeout: 600000 })
   return unwrap<{ docs: number; chunks: number }>(r.data, '重建索引失败')
+}
+
+/** 读取当前用户切分参数（未设置过返回默认 500/50） */
+export async function getKbSettings(): Promise<KbSettings> {
+  const r = await http.get('/settings')
+  return unwrap<KbSettings>(r.data, '获取切分参数失败')
+}
+
+/** 入库/重建进度（前端轮询展示进度条） */
+export interface KbProgress {
+  status: 'idle' | 'processing' | 'done' | 'error'
+  phase?: 'parsing' | 'embedding' | 'rebuilding'
+  done?: number
+  total?: number
+  detail?: string
+}
+
+/** 查询当前用户入库/重建进度 */
+export async function getProgress(): Promise<KbProgress> {
+  const r = await http.get('/progress', { timeout: 10000 })
+  return unwrap<KbProgress>(r.data, '获取进度失败')
+}
+
+/** 保存当前用户切分参数（修改后需重建索引才对存量文档生效） */
+export async function saveKbSettings(body: KbSettings): Promise<KbSettings> {
+  const r = await http.put('/settings', body)
+  return unwrap<KbSettings>(r.data, '保存切分参数失败')
 }
 
 // ---------------- 聊天记录导入 ----------------

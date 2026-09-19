@@ -12,16 +12,22 @@ import {
   addText,
   changeDocType,
   deleteDoc,
+  getKbSettings,
   importChat,
   importTableSchema,
+  kbImageUrl,
   listDocs,
   parseChat,
   reindex,
+  saveKbSettings,
   searchDocs,
   uploadDoc,
+  getProgress,
   type ChatParseBody,
   type ChatPreview,
   type DocInfo,
+  type KbProgress,
+  type KbSettings,
   type SearchHit,
 } from '../api/knowledge'
 import { confirmDanger } from '../utils/dialog'
@@ -52,6 +58,30 @@ async function removeDoc(d: DocInfo) {
   }
 }
 
+// ---------------- 入库/重建进度 ----------------
+const kbProgress = ref<KbProgress>({ status: 'idle' })
+let _progressTimer: ReturnType<typeof setInterval> | null = null
+
+function startProgressPoll() {
+  stopProgressPoll()
+  _progressTimer = setInterval(async () => {
+    try {
+      kbProgress.value = await getProgress()
+      if (kbProgress.value.status === 'done' || kbProgress.value.status === 'error') {
+        stopProgressPoll()
+      }
+    } catch { /* 忽略轮询错误 */ }
+  }, 1500)
+}
+function stopProgressPoll() {
+  if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null }
+}
+const progressPct = computed(() => {
+  const { done, total } = kbProgress.value
+  if (!total || total <= 0) return 0
+  return Math.min(100, Math.round(((done ?? 0) / total) * 100))
+})
+
 // ---------------- 重建索引（按新分块策略重新切分 + 重新向量化） ----------------
 const reindexing = ref(false)
 async function rebuildIndex() {
@@ -60,6 +90,8 @@ async function rebuildIndex() {
     '将按当前分块策略（更大块 + 重叠）对全部文档重新切分并重新向量化。文档内容保留不丢失，过程可能耗时较长，确认重建？',
   ))) return
   reindexing.value = true
+  kbProgress.value = { status: 'processing', detail: '重建索引中…' }
+  startProgressPoll()
   try {
     const r = await reindex()
     toast(`重建完成：${r.docs} 篇文档，${r.chunks} 个块`)
@@ -67,6 +99,7 @@ async function rebuildIndex() {
   } catch (e) {
     toast(e instanceof Error ? e.message : '重建索引失败', true)
   } finally {
+    stopProgressPoll()
     reindexing.value = false
   }
 }
@@ -92,11 +125,12 @@ function toast(text: string, error = false) {
   toastTimer = setTimeout(() => (toastMsg.value = null), 3000)
 }
 
-// ---------------- 文档类型（4 类，code + 中文 + 颜色）----------------
+// ---------------- 文档类型（5 类，code + 中文 + 颜色）----------------
 const DOC_TYPES = [
   { code: 'guide', label: '操作指导类', color: 'blue' },
   { code: 'bug', label: 'BUG修复类', color: 'orange' },
   { code: 'schema', label: '表结构类', color: 'green' },
+  { code: 'medical', label: '医疗文件类', color: 'purple' },
   { code: 'other', label: '其他', color: 'gray' },
 ] as const
 
@@ -131,6 +165,8 @@ async function onFilePicked(ev: Event) {
   const files = (ev.target as HTMLInputElement).files
   if (!files || !files.length) return
   uploading.value = true
+  kbProgress.value = { status: 'processing', detail: '解析文档中…' }
+  startProgressPoll()
   try {
     for (const f of Array.from(files)) {
       await uploadDoc(f, uploadType.value, uploadTitle.value || undefined)
@@ -141,6 +177,7 @@ async function onFilePicked(ev: Event) {
   } catch (e) {
     toast(e instanceof Error ? e.message : '上传失败', true)
   } finally {
+    stopProgressPoll()
     uploading.value = false
     if (fileInput.value) fileInput.value.value = ''
   }
@@ -345,6 +382,48 @@ async function changeType(d: DocInfo, ev: Event) {
   }
 }
 
+// ---------------- 切分参数设置（每用户可调，仅模式B文档生效）----------------
+const CHUNK_SIZE_RANGE: [number, number] = [300, 1000]
+const OVERLAP_RANGE: [number, number] = [0, 200]
+const kbSettings = ref<KbSettings>({ chunk_size: 500, chunk_overlap: 50 })
+const settingsOpen = ref(false)
+const savingSettings = ref(false)
+
+async function loadSettings() {
+  try {
+    kbSettings.value = await getKbSettings()
+  } catch (e) {
+    // 设置加载失败不阻断页面，使用默认值
+    console.warn(e)
+  }
+}
+
+/** 数字输入/滑块双向联动时夹紧到合法区间 */
+function clampSetting(key: keyof KbSettings, range: [number, number]) {
+  let v = Number(kbSettings.value[key])
+  if (Number.isNaN(v)) v = range[0]
+  kbSettings.value[key] = Math.min(range[1], Math.max(range[0], Math.round(v)))
+}
+
+async function saveSettings() {
+  clampSetting('chunk_size', CHUNK_SIZE_RANGE)
+  clampSetting('chunk_overlap', OVERLAP_RANGE)
+  savingSettings.value = true
+  try {
+    kbSettings.value = await saveKbSettings({ ...kbSettings.value })
+    toast('已保存，修改后需重建索引生效')
+  } catch (e) {
+    toast(e instanceof Error ? e.message : '保存失败', true)
+  } finally {
+    savingSettings.value = false
+  }
+}
+
+/** 新窗口查看知识库原图（URL 已带鉴权 token） */
+function openImage(url: string) {
+  window.open(kbImageUrl(url), '_blank')
+}
+
 // 检索示例问题（点击填入并自动检索）
 const searchExamples = [
   'ORA-01555 怎么处理',
@@ -357,7 +436,10 @@ function fillExample(q: string) {
   runSearch()
 }
 
-onMounted(refreshDocs)
+onMounted(() => {
+  refreshDocs()
+  loadSettings()
+})
 </script>
 
 <template>
@@ -379,8 +461,78 @@ onMounted(refreshDocs)
               {{ loadingDocs ? '刷新中…' : '刷新' }}
             </button>
           </div>
+          <div v-if="reindexing && kbProgress.status === 'processing'" class="kb-progress-inline">
+            <span class="hint">{{ kbProgress.detail }}</span>
+            <div v-if="kbProgress.total" class="kb-progress">
+              <div class="kb-progress-bar" :style="{ width: progressPct + '%' }"></div>
+              <span class="kb-progress-text">{{ progressPct }}%</span>
+            </div>
+          </div>
         </div>
         <div class="kb-col-body">
+          <!-- 切分参数设置（每用户自己的参数，仅模式B文档生效） -->
+          <div class="kb-settings">
+            <div class="settings-head" @click="settingsOpen = !settingsOpen">
+              <span class="settings-title">⚙ 切分参数设置</span>
+              <span class="settings-summary">
+                {{ kbSettings.chunk_size }} / {{ kbSettings.chunk_overlap }}
+                <span class="caret">{{ settingsOpen ? '▴' : '▾' }}</span>
+              </span>
+            </div>
+            <div v-show="settingsOpen" class="settings-body">
+              <div class="setting-row">
+                <div class="setting-label">
+                  <span>单块大小（chunk_size）</span>
+                  <input
+                    v-model.number="kbSettings.chunk_size"
+                    type="number"
+                    class="setting-num"
+                    min="300"
+                    max="1000"
+                    @blur="clampSetting('chunk_size', CHUNK_SIZE_RANGE)"
+                  />
+                </div>
+                <input
+                  v-model.number="kbSettings.chunk_size"
+                  type="range"
+                  class="setting-range"
+                  min="300"
+                  max="1000"
+                  step="50"
+                />
+                <div class="setting-scale"><span>300</span><span>1000 字</span></div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-label">
+                  <span>相邻重叠（chunk_overlap）</span>
+                  <input
+                    v-model.number="kbSettings.chunk_overlap"
+                    type="number"
+                    class="setting-num"
+                    min="0"
+                    max="200"
+                    @blur="clampSetting('chunk_overlap', OVERLAP_RANGE)"
+                  />
+                </div>
+                <input
+                  v-model.number="kbSettings.chunk_overlap"
+                  type="range"
+                  class="setting-range"
+                  min="0"
+                  max="200"
+                  step="10"
+                />
+                <div class="setting-scale"><span>0</span><span>200 字</span></div>
+              </div>
+              <button class="btn primary sm settings-save" :disabled="savingSettings" @click="saveSettings">
+                {{ savingSettings ? '保存中…' : '保存设置' }}
+              </button>
+              <div class="settings-tip">
+                仅对「操作指导 / BUG修复 / 其他」类生效；表结构、医疗文件按语义自动切分。修改后需点上方「重建索引」对存量文档生效。
+              </div>
+            </div>
+          </div>
+
           <div v-if="!docs.length && !loadingDocs" class="empty">暂无文档，可从中栏入库</div>
           <div v-else class="doc-groups">
             <div v-for="t in DOC_TYPES" :key="t.code" class="doc-group">
@@ -437,7 +589,13 @@ onMounted(refreshDocs)
               <input ref="fileInput" type="file" class="file-input" multiple
                      accept=".txt,.md,.sql,.pdf,.docx" :disabled="uploading" @change="onFilePicked" />
             </div>
-            <div v-if="uploading" class="hint">解析入库中，请稍候…</div>
+            <div v-if="uploading" class="hint">
+              {{ kbProgress.detail || '解析入库中，请稍候…' }}
+              <div v-if="kbProgress.status === 'processing' && kbProgress.total" class="kb-progress">
+                <div class="kb-progress-bar" :style="{ width: progressPct + '%' }"></div>
+                <span class="kb-progress-text">{{ progressPct }}%</span>
+              </div>
+            </div>
           </div>
 
           <div v-show="activeTab === 'paste'" class="tab-pane">
@@ -584,6 +742,21 @@ onMounted(refreshDocs)
                 </span>
               </div>
               <div class="hit-text">{{ h.text.slice(0, 200) }}{{ h.text.length > 200 ? '…' : '' }}</div>
+              <!-- 位置信息：页码 + 页眉 -->
+              <div v-if="h.page" class="hit-loc">
+                📄 第 {{ h.page }} 页<span v-if="h.header" class="hit-header">（页眉：{{ h.header }}）</span>
+              </div>
+              <!-- 命中块原图回显 -->
+              <div v-if="h.images && h.images.length" class="hit-imgs">
+                <img
+                  v-for="im in h.images"
+                  :key="im.id"
+                  :src="kbImageUrl(im.url)"
+                  :title="im.page ? `第${im.page}页原图，点击查看` : '原图，点击查看'"
+                  loading="lazy"
+                  @click="openImage(im.url)"
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -756,7 +929,72 @@ onMounted(refreshDocs)
 .tag-blue { background: #dbeafe; color: #1e40af; border: 1px solid #93c5fd; }
 .tag-orange { background: #ffedd5; color: #9a3412; border: 1px solid #fdba74; }
 .tag-green { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+.tag-purple { background: #f3e8ff; color: #6b21a8; border: 1px solid #d8b4fe; }
 .tag-gray { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
+/* 切分参数设置区 */
+.kb-settings {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.settings-head:hover { background: var(--surface); }
+.settings-title { font-size: 15px; font-weight: 600; color: var(--text-main); }
+.settings-summary { font-size: 13px; color: var(--text-sub); display: flex; align-items: center; gap: 6px; }
+.settings-summary .caret { font-size: 12px; }
+.settings-body { padding: 4px 12px 12px; border-top: 1px solid var(--border); }
+.setting-row { margin: 12px 0 4px; }
+.setting-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  color: var(--text-main);
+  margin-bottom: 6px;
+}
+.setting-num {
+  width: 84px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--text-main);
+  background: var(--surface);
+  outline: none;
+}
+.setting-num:focus { border-color: var(--primary); }
+.setting-range {
+  width: 100%;
+  accent-color: var(--primary);
+  cursor: pointer;
+  height: 24px;
+}
+.setting-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-sub);
+  margin-top: -2px;
+}
+.settings-save { width: 100%; margin-top: 8px; }
+.settings-tip {
+  margin-top: 10px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-sub);
+  background: var(--surface);
+  border-radius: 6px;
+}
 /* Tab 切换（上传三功能，字号 17px） */
 .tab-bar {
   display: flex;
@@ -802,6 +1040,35 @@ onMounted(refreshDocs)
 .input.grow { flex: 1; width: auto; }
 .file-input { font-size: 13px; color: var(--text-sub); padding: 10px; border: 1px dashed var(--border); border-radius: 8px; background: var(--bg); width: 100%; box-sizing: border-box; }
 .hint { font-size: 14px; color: var(--primary); }
+
+/* 入库/重建进度条 */
+.kb-progress {
+  position: relative;
+  height: 18px;
+  margin-top: 6px;
+  background: var(--bg-alt, #e9ecef);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.kb-progress-bar {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  background: var(--primary, #3b82f6);
+  border-radius: 9px;
+  transition: width 0.3s ease;
+}
+.kb-progress-text {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+  color: var(--text, #333);
+  font-weight: 600;
+}
+.kb-progress-inline {
+  margin-top: 4px;
+}
 
 /* 导入聊天记录 tab 样式 */
 .radio-group {
@@ -949,6 +1216,31 @@ onMounted(refreshDocs)
 }
 .hit-meta { margin-left: auto; font-size: 14px; color: var(--text-sub); flex: none; }
 .hit-text { font-size: 15px; color: var(--text-sub); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+/* 命中位置（页码/页眉） */
+.hit-loc {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--primary);
+}
+.hit-header { color: var(--text-sub); }
+/* 命中块原图 */
+.hit-imgs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.hit-imgs img {
+  height: 96px;
+  max-width: 160px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: zoom-in;
+  background: var(--bg);
+  transition: transform 0.15s;
+}
+.hit-imgs img:hover { transform: scale(1.03); border-color: var(--primary); }
 .empty { padding: 24px 0; text-align: center; color: var(--text-sub); font-size: 14px; }
 /* 检索空状态：大图标 + 提示 + 示例问题 */
 .search-empty {
