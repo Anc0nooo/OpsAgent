@@ -143,7 +143,7 @@ export async function getKbSettings(): Promise<KbSettings> {
 /** 入库/重建进度（前端轮询展示进度条） */
 export interface KbProgress {
   status: 'idle' | 'processing' | 'done' | 'error'
-  phase?: 'parsing' | 'embedding' | 'rebuilding'
+  phase?: 'parsing' | 'splitting' | 'embedding'
   done?: number
   total?: number
   detail?: string

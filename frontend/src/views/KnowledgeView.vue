@@ -61,12 +61,15 @@ async function removeDoc(d: DocInfo) {
 // ---------------- 入库/重建进度 ----------------
 const kbProgress = ref<KbProgress>({ status: 'idle' })
 let _progressTimer: ReturnType<typeof setInterval> | null = null
+const _maxPct = ref(0)   // 单调夹紧：进度只增不减，不回跳
 
 function startProgressPoll() {
   stopProgressPoll()
+  _maxPct.value = 0
   _progressTimer = setInterval(async () => {
     try {
       kbProgress.value = await getProgress()
+      if (pctRaw.value > _maxPct.value) _maxPct.value = pctRaw.value
       if (kbProgress.value.status === 'done' || kbProgress.value.status === 'error') {
         stopProgressPoll()
       }
@@ -76,11 +79,15 @@ function startProgressPoll() {
 function stopProgressPoll() {
   if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null }
 }
-const progressPct = computed(() => {
-  const { done, total } = kbProgress.value
-  if (!total || total <= 0) return 0
-  return Math.min(100, Math.round(((done ?? 0) / total) * 100))
+// 阶段化百分比：解析/分块 0-40%，向量化 40-100%（阶段间天然单调，再叠加历史最大值夹紧）
+const pctRaw = computed(() => {
+  const p = kbProgress.value
+  if (p.status === 'done') return 100
+  const frac = (p.total ?? 0) > 0 ? Math.min(1, (p.done ?? 0) / (p.total ?? 1)) : 0
+  if (p.phase === 'embedding') return Math.round(40 + frac * 60)
+  return Math.round(frac * 40)
 })
+const progressPct = computed(() => Math.max(pctRaw.value, _maxPct.value))
 
 // ---------------- 重建索引（按新分块策略重新切分 + 重新向量化） ----------------
 const reindexing = ref(false)
@@ -169,6 +176,7 @@ async function onFilePicked(ev: Event) {
   startProgressPoll()
   try {
     for (const f of Array.from(files)) {
+      _maxPct.value = 0   // 每个文件重新计进度
       await uploadDoc(f, uploadType.value, uploadTitle.value || undefined)
       toast(`「${f.name}」入库成功`)
     }

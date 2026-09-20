@@ -124,10 +124,11 @@ async def upload_doc(
     data = await file.read()
     uid = user.id
     # 进度回调（供 GET /progress 轮询）
-    def _progress(done, total):
-        set_progress(uid, status="processing", phase="embedding",
+    def _progress(phase, done, total):
+        label = "向量化" if phase == "embedding" else "解析分块"
+        set_progress(uid, status="processing", phase=phase,
                      done=done, total=total,
-                     detail=f"向量化 {done}/{total}")
+                     detail=f"{label} {done}/{total}")
     set_progress(uid, status="processing", phase="parsing",
                  done=0, total=0, detail="解析文档中…")
     try:
@@ -459,11 +460,12 @@ async def reindex(db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)) -> dict:
     """重建索引：按当前分块策略对当前用户全部文档重新切分 + 重新向量化（耗时操作）。"""
     uid = user.id
-    def _progress(done, total):
-        set_progress(uid, status="processing", phase="embedding",
+    def _progress(phase, done, total):
+        label = "向量化" if phase == "embedding" else "解析分块"
+        set_progress(uid, status="processing", phase=phase,
                      done=done, total=total,
-                     detail=f"向量化 {done}/{total}")
-    set_progress(uid, status="processing", phase="rebuilding",
+                     detail=f"{label} {done}/{total}")
+    set_progress(uid, status="processing", phase="splitting",
                  done=0, total=0, detail="重建索引中…")
     try:
         loop = asyncio.get_event_loop()

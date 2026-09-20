@@ -268,7 +268,7 @@ class KnowledgeService:
 
         - 按 EMBED_BATCH_SIZE(16) 分批，一次请求传整批
         - 单批失败：重试一次 → 逐条降级 → 标记 None
-        - 进度回调 progress_cb(done, total) 每批调用一次
+        - 进度回调 progress_cb(phase, done, total)，phase="embedding"，每批调用一次
         """
         if not texts:
             return []
@@ -283,7 +283,7 @@ class KnowledgeService:
                 result[i + j] = v
             done += len(batch)
             if progress_cb:
-                progress_cb(done, len(texts))
+                progress_cb("embedding", done, len(texts))
         return result
 
     @staticmethod
@@ -416,6 +416,10 @@ class KnowledgeService:
             chunks = self._split_parsed(db, user_id, parsed, doc_type)
             if not chunks:
                 raise ValueError("文档内容为空，无法入库")
+            # 排查日志：文档类型 → 切分模式（A 语义 / B 用户参数）→ 块数
+            _mode = "A语义" if doc_type in SEMANTIC_TYPES else "B参数"
+            logger.info("文档《%s》doc_type=%s 切分模式=%s 解析块=%d → chunk=%d",
+                        title, doc_type, _mode, len(parsed.blocks), len(chunks))
 
             # 3. 图片登记 kb_images 并把 key 映射为 image_id 回填 chunk 元数据
             key_to_id: dict[str, int] = {}
@@ -892,9 +896,11 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     def rebuild_index(self, db: Session, user_id: int, progress_cb=None) -> dict:
         """
-        全量重建（当前用户）：重置 collection → 逐篇取全文按新策略重切 →
-        重写 MySQL 块 → 重新向量化入库 → 重建 BM25。文档行（title/type/source）保留。
-        返回 {"docs", "chunks", "detail": [{doc_id,title,chunks}]}。
+        全量重建（当前用户），两阶段执行：
+        阶段1 解析分块：逐篇按新策略重切并写 MySQL（进度按篇数推进）；
+        阶段2 批量向量化：总块数在阶段1结束后已知，进度跨文档单调累加、不回跳。
+        progress_cb(phase, done, total)：phase ∈ splitting / embedding。
+        文档行（title/type/source）保留。返回 {"docs", "chunks", "detail"}。
         """
         docs = rag_db.list_docs(db, user_id)
         total_docs = len(docs)
@@ -907,9 +913,11 @@ class KnowledgeService:
         self._collections.pop(user_id, None)
         col = self._get_collection(user_id)
 
+        # ---- 阶段1：解析 → 切分 → 写 MySQL（进度按篇数推进）----
         total_chunks = 0
         detail: list[dict] = []
-        for d in docs:
+        pending: list[dict] = []  # 待向量化 {ids, texts, metadatas}
+        for i, d in enumerate(docs):
             did = d["id"]
             old_chunks = rag_db.get_doc_chunks(db, did)
             parsed = self._load_parsed_cache(did)
@@ -931,29 +939,47 @@ class KnowledgeService:
                 # 纯文本文档（粘贴/聊天记录）：旧块用单换行拼全文按当前策略重切。
                 # 单换行能让被切散的 Markdown 表格行重新连续（空行会打断表格识别）
                 full_text = "\n".join(c["text"] for c in old_chunks).strip()
-                if not full_text:
-                    continue
-                new_chunks = self._split_typed(db, user_id, full_text, d["doc_type"])
+                new_chunks = (self._split_typed(db, user_id, full_text, d["doc_type"])
+                              if full_text else [])
+            if progress_cb:
+                progress_cb("splitting", i + 1, total_docs)
             if not new_chunks:
                 continue
             ids = rag_db.insert_chunks(db, did, d["doc_type"], new_chunks, start_seq=0)
             rag_db.update_doc_meta(db, did, user_id, chunk_count=len(ids))
-
-            # 3. 重新向量化写入 Chroma
-            texts = [c["text"] for c in new_chunks]
-            vectors = self._embed_chunks(db, user_id, texts, progress_cb=progress_cb)
-            metadatas = [
-                {"doc_id": did, "doc_title": d["title"], "section": c.get("section", ""), "doc_type": d["doc_type"]}
-                for c in new_chunks
-            ]
-            v_ids, v_texts, v_vecs, v_metas = self._filter_valid(ids, texts, vectors, metadatas)
-            if v_ids:
-                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
             total_chunks += len(ids)
             detail.append({"doc_id": did, "title": d["title"], "chunks": len(ids)})
-            logger.info("用户 %s 重建索引：《%s》→ %d 块", user_id, d["title"], len(ids))
+            _mode = "A语义" if d["doc_type"] in SEMANTIC_TYPES else "B参数"
+            logger.info("用户 %s 重建索引：《%s》doc_type=%s 模式=%s → %d 块",
+                        user_id, d["title"], d["doc_type"], _mode, len(ids))
+            pending.append({
+                "ids": ids,
+                "texts": [c["text"] for c in new_chunks],
+                "metadatas": [
+                    {"doc_id": did, "doc_title": d["title"], "section": c.get("section", ""),
+                     "doc_type": d["doc_type"]}
+                    for c in new_chunks
+                ],
+            })
 
-        # 4. 重建 BM25
+        # ---- 阶段2：批量向量化（总块数已知，done 跨文档累加、单调递增）----
+        embed_total = sum(len(p["texts"]) for p in pending)
+        done_base = 0
+        for p in pending:
+            if not p["texts"]:
+                continue
+            cb = None
+            if progress_cb:
+                def cb(done, _t, _base=done_base):  # noqa: E306
+                    progress_cb("embedding", _base + done, embed_total)
+            vectors = self._embed_chunks(db, user_id, p["texts"], progress_cb=cb)
+            v_ids, v_texts, v_vecs, v_metas = self._filter_valid(
+                p["ids"], p["texts"], vectors, p["metadatas"])
+            if v_ids:
+                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
+            done_base += len(p["texts"])
+
+        # 2. 重建 BM25
         self._bm25_map.pop(user_id, None)
         self._get_bm25(db, user_id, rebuild=True)
         logger.info("用户 %s 重建索引完成：%d 篇文档，%d 个块", user_id, len(docs), total_chunks)

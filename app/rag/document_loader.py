@@ -13,6 +13,7 @@ RAG 知识库 - 结构化文档加载器
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -21,6 +22,105 @@ logger = logging.getLogger(__name__)
 
 # OCR 回调：(图片字节, mime) -> 识别文字（无文字返回 ""）；加载器不关心用哪个模型
 OcrFn = Callable[[bytes, str], str]
+
+
+# ----------------------------------------------------------------------
+# 物理行合并（PDF/Word 提取的换行是排版换行，不是段落边界）
+# ----------------------------------------------------------------------
+_CJK_RANGES = (("\u4e00", "\u9fff"), ("\u3000", "\u303f"), ("\uff00", "\uffef"))
+
+
+def _is_cjk(ch: str) -> bool:
+    """CJK 汉字 / 中文标点 / 全角字符"""
+    return any(lo <= ch <= hi for lo, hi in _CJK_RANGES)
+
+
+def _join_text(a: str, b: str) -> str:
+    """拼接两段文本：CJK（含中文标点）或数字边界直接相连，仅英文字母间补空格"""
+    a, b = a.rstrip(), b.lstrip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if _is_cjk(a[-1]) or _is_cjk(b[0]):
+        return a + b
+    if a[-1].isascii() and a[-1].isalpha() and b[0].isascii() and b[0].isalpha():
+        return a + " " + b
+    return a + b
+
+
+def _join_phys_lines(text: str) -> str:
+    """块内物理换行合并成完整段落（断行的句子接回一句）"""
+    out = ""
+    for ln in text.split("\n"):
+        ln = ln.strip()
+        if ln:
+            out = _join_text(out, ln)
+    return out
+
+
+# PDF 提取文本中因字形间隙被插入的多余空格：
+# CJK-CJK / 数字-数字 / CJK-数字 之间不应有空格（英文字母间的空格保留）
+_PDF_SPACE_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])"
+    r"|(?<=\d)\s+(?=\d)"
+    r"|(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+(?=\d)"
+    r"|(?<=\d)\s+(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])")
+
+
+def _clean_pdf_spaces(text: str) -> str:
+    """清理 PDF 文本提取产生的中文/数字间多余空格"""
+    return _PDF_SPACE_RE.sub("", text)
+
+
+# 段落续行起始特征：跨页合并时避免把新段落/标题并进上一段
+_CONT_START_RE = re.compile(
+    r"^(第[一二三四五六七八九十百\d]+[章节条款部分篇]"
+    r"|[（(][一二三四五六七八九十\d]+[）)、．.]"
+    r"|[一二三四五六七八九十]+、"
+    r"|\d+(\.\d+)*[、.\s]"
+    r"|[•·●■□▶]\s)")
+
+
+def _merge_cross_page_paragraphs(blocks: list) -> list:
+    """跨页段落续行合并：上一页末段无句末标点且下页首段非新段落特征 → 并回一段"""
+    if not blocks:
+        return blocks
+    out = [blocks[0]]
+    for b in blocks[1:]:
+        prev = out[-1]
+        if (b.kind == "paragraph" and prev.kind == "paragraph"
+                and b.page is not None and prev.page is not None
+                and b.page == prev.page + 1
+                and prev.text and prev.text[-1] not in "。！？…"
+                and not _CONT_START_RE.match(b.text)):
+            prev.text = _join_text(prev.text, b.text)
+            prev.images.extend(b.images)
+        else:
+            out.append(b)
+    return out
+
+
+def _same_pdf_para(prev: list, cur: list, gap_thr: float) -> bool:
+    """两个 PDF 文字块是否属于同一段落（同页相邻块合并依据）
+
+    - 同一行被拆开的片段（垂直范围重叠，常见于中英文/字体切换）：无条件同段；
+    - 相邻行：垂直间距 ≤ 行距阈值 且 水平范围重叠（同栏）→ 同段。
+    """
+    if prev[5] != "paragraph" or cur[5] != "paragraph":
+        return False
+    px0, py0, px1, py1 = prev[:4]
+    cx0, cy0, cx1, cy1 = cur[:4]
+    # 同行碎片：垂直投影重叠超过较小块高的一半
+    v_overlap = min(py1, cy1) - max(py0, cy0)
+    ph_h, ch_h = py1 - py0, cy1 - cy0
+    if ph_h > 0 and ch_h > 0 and v_overlap > 0.5 * min(ph_h, ch_h):
+        return True
+    # 相邻行：间距小 + 同栏
+    if cy0 - py1 > gap_thr:
+        return False
+    x_overlap = min(px1, cx1) - max(px0, cx0)
+    return x_overlap > 0.3 * min(px1 - px0, cx1 - cx0)
 
 
 @dataclass
@@ -165,12 +265,15 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                                 sizes.append(float(sp.get("size", 0)))
             except Exception:  # noqa: BLE001
                 pass
-            big_size = (sorted(sizes)[len(sizes) // 2] * 1.15) if sizes else 999.0
+            median_size = (sorted(sizes)[len(sizes) // 2]) if sizes else 12.0
+            big_size = median_size * 1.15 if sizes else 999.0
 
+            # ---- 文字块收集（含 bbox 与标题判定；供同段落碎片合并）----
+            items: list[list] = []  # [x0, y0, x1, y1, text, kind]
             for item in raw_blocks:
                 x0, y0, x1, y1, txt = item[0], item[1], item[2], item[3], item[4]
                 btype = item[6] if len(item) > 6 else 0
-                body = txt.strip()
+                body = _join_phys_lines(txt)  # 块内物理换行 → 完整段落
                 if btype != 0 or not body:
                     continue
                 if in_table(x0, y0, x1, y1):
@@ -183,7 +286,21 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                     footer_text = (footer_text + " " + body).strip()
                     continue
                 kind = "heading" if len(body) <= 40 and _block_max_size(page, x0, y0, x1, y1) >= big_size else "paragraph"
-                blocks.append(Block(kind=kind, text=body, page=page_no,
+                items.append([x0, y0, x1, y1, body, kind])
+
+            # ---- 同段落碎片合并：不少 PDF 把一行/一个字体片段拆成独立 block ----
+            para_gap = max(6.0, median_size * 0.7)
+            merged_items: list[list] = []
+            for it in items:
+                if merged_items and _same_pdf_para(merged_items[-1], it, para_gap):
+                    m = merged_items[-1]
+                    m[0], m[1] = min(m[0], it[0]), min(m[1], it[1])
+                    m[2], m[3] = max(m[2], it[2]), max(m[3], it[3])
+                    m[4] = _join_text(m[4], it[4])
+                else:
+                    merged_items.append(list(it))
+            for x0, y0, x1, y1, body, kind in merged_items:
+                blocks.append(Block(kind=kind, text=_clean_pdf_spaces(body), page=page_no,
                                     header=header_text, footer=footer_text))
 
             # ---- 表格 → Markdown（排在文字块之后、按 y0 近似插入位置）----
@@ -236,7 +353,9 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 elif blocks and blocks[-1].page == page_no:
                     blocks[-1].images.append(img_ref)
 
-    return ParsedDocument(kind="pdf", blocks=blocks, image_files=image_files)
+    # 跨页段落续行合并（段落被分页打断的场景）
+    return ParsedDocument(kind="pdf", blocks=_merge_cross_page_paragraphs(blocks),
+                          image_files=image_files)
 
 
 def _block_max_size(page, x0: float, y0: float, x1: float, y1: float) -> float:
@@ -327,6 +446,9 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
             style = (p.style.name or "") if p.style else ""
             if text:
                 kind = "heading" if style.lower().startswith("heading") or style.startswith("标题") else "paragraph"
+                # 段内软换行（w:br）合并成完整段落
+                if kind == "paragraph":
+                    text = _join_phys_lines(text)
                 blocks.append(Block(kind=kind, text=text, header=header_text, footer=footer_text, images=imgs))
             elif imgs:
                 # 纯图片段落：有 OCR 文字则成块，否则挂到上一块
@@ -351,7 +473,9 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
 def _extract_text(data: bytes, filename: str) -> ParsedDocument:
     text = data.decode("utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
     blocks: list[Block] = []
-    is_md = filename.lower().endswith((".md", ".markdown"))
+    lower = filename.lower()
+    is_md = lower.endswith((".md", ".markdown"))
+    is_sql = lower.endswith(".sql")
     # 空行分段；段内首行若为标题则标记
     for raw in text.split("\n\n"):
         body = raw.strip()
@@ -361,9 +485,14 @@ def _extract_text(data: bytes, filename: str) -> ParsedDocument:
             first_line, _, rest = body.partition("\n")
             blocks.append(Block(kind="heading", text=first_line.lstrip("# ").strip()))
             if rest.strip():
-                blocks.append(Block(kind="paragraph", text=rest.strip()))
-        else:
+                body = rest.strip()
+            else:
+                continue
+        # 段内物理换行合并（SQL/含 Markdown 表格行的段落保留原换行）
+        if is_sql or any(ln.lstrip().startswith("|") for ln in body.split("\n")):
             blocks.append(Block(kind="paragraph", text=body))
+        else:
+            blocks.append(Block(kind="paragraph", text=_join_phys_lines(body)))
     return ParsedDocument(kind="text", blocks=blocks)
 
 
