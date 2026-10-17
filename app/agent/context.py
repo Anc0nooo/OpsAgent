@@ -149,15 +149,21 @@ def _collect_sources(segments: list[dict], schema_hits: list[dict],
         if did not in grouped:
             grouped[did] = {
                 "doc_id": did, "doc_title": h.get("doc_title", ""),
-                "pages": [], "images": [], "similarity": 0.0,
+                "pages": [], "images": [], "similarity": None,  # None=无有效相似度（前端显示 —）
             }
             order.append(did)
         g = grouped[did]
-        # 相似度取该文档所有命中片段的最高分（混合检索融合分，0~1）
-        try:
-            g["similarity"] = max(g["similarity"], float(h.get("score") or 0.0))
-        except (TypeError, ValueError):
-            pass
+        # 相似度口径：优先 vector_sim（query 与 chunk 的真实余弦相似度，0~1）；
+        # score 是 rerank/融合排序分（可能极小如 0.003），不代表语义相似度，仅作兜底。
+        # None/NaN 按缺失处理（保持 None，前端显示 —，不给出误导性 0.00）
+        for key in ("vector_sim", "score"):
+            try:
+                v = float(h.get(key))
+                if v == v:  # NaN 检查
+                    g["similarity"] = v if g["similarity"] is None else max(g["similarity"], v)
+                    break
+            except (TypeError, ValueError):
+                continue
         pages = h.get("pages") or ([h.get("page")] if h.get("page") else [])
         for p in pages:
             if p not in g["pages"]:
@@ -169,7 +175,8 @@ def _collect_sources(segments: list[dict], schema_hits: list[dict],
     for g in grouped.values():
         g["pages"].sort()
     out = [grouped[d] for d in order]
-    out.sort(key=lambda s: s["similarity"], reverse=True)  # 按相似度降序（与展示顺序一致）
+    # 按相似度降序（None 排最后；相似度取值 0~1，-1.0 哨兵保证 None 恒排末尾）
+    out.sort(key=lambda s: s["similarity"] if s["similarity"] is not None else -1.0, reverse=True)
     if max_docs and len(out) > max_docs:
         out = out[:max_docs]
     return out

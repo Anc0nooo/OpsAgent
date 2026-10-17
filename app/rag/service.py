@@ -104,6 +104,23 @@ def get_chunk_profile(doc_type: str) -> tuple[int, int, int]:
     )
 
 
+def _cosine_sim(a: list[float], b: list[float]) -> float | None:
+    """两向量的余弦相似度（0~1 方向的原始值）；维度不一致（embedding 模型切换的新旧向量混存）
+    或零向量/NaN 时返回 None（调用方按缺失处理，显示为 —，不给出误导性 0 值）。"""
+    try:
+        if len(a) != len(b):
+            return None
+        dot = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(x * x for x in b) ** 0.5
+        if na <= 0.0 or nb <= 0.0:
+            return None
+        sim = dot / (na * nb)
+        return None if sim != sim else sim  # NaN 检查
+    except (TypeError, ValueError):
+        return None
+
+
 class KnowledgeService:
     """知识库服务（多用户隔离，全局单例；方法按 user_id 隔离数据）"""
 
@@ -785,48 +802,122 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     # 检索（混合召回 + 重排，按用户隔离）
     # ------------------------------------------------------------------
-    # ---- 回显图片过滤阈值：只展示"OCR 含有效文字"或"面积 >5% 页面"的图 ----
-    # 装饰图/Logo/背景空白图通常两者都不满足；入库元数据保留，仅过滤展示层
-    DISPLAY_IMG_MIN_OCR_CHARS = 10               # OCR 有效文字最少字符数
-    DISPLAY_IMG_MIN_AREA = 0.05 * 595 * 842      # ≈25060 pt²，按 A4 纵向页面 5% 面积近似
+    # ---- 回显图片过滤（展示层二次兜底，口径与入库源头过滤对齐）----
+    # 保留条件：OCR 有效文字 ≥10 字（实质内容/表格截图），且不在页眉页脚固定区域。
+    # 面积兜底已取消：空白大图/无文字装饰图正是漏网主因，无 OCR 文字的图一律不回显
+    # （真正与回答相关的插图 OCR 均能出字）。源头过滤见 document_loader._drop_junk_images。
+    DISPLAY_IMG_MIN_OCR_CHARS = 10               # OCR 有效文字最少字符数（与 IMG_MIN_OCR_CHARS 一致）
+    DISPLAY_HF_TOP = 0.08 * 842                  # ≈67pt：页眉区上限（A4 纵向近似，旧数据无 hf 标记的兜底）
+    DISPLAY_HF_BOTTOM = 0.92 * 842               # ≈775pt：页脚区下限
 
     @classmethod
     def filter_displayable_images(cls, images: list[dict] | None) -> list[dict]:
-        """过滤不回显的图片：OCR 文字 ≥10 字（有实质内容）或面积 >5% 页面（正文插图），
-        其余（装饰图/Logo/背景空白图）不进入回显列表。bbox/ocr_text 缺失的按装饰图处理。"""
+        """过滤不回显的图片：OCR 有效文字 ≥10 字且非页眉页脚区域图（新数据带 hf 标记，
+        旧数据按 bbox 落在上下 8% 区域近似判定）。无有效 OCR 文字的装饰图/空白图/Logo 一律不回显。"""
         out: list[dict] = []
         for im in images or []:
-            if len(str(im.get("ocr_text") or "").strip()) >= cls.DISPLAY_IMG_MIN_OCR_CHARS:
-                out.append(im)
-                continue
-            try:
-                x0, y0, x1, y1 = (float(v) for v in str(im.get("bbox") or "").split(","))
-                if (x1 - x0) * (y1 - y0) > cls.DISPLAY_IMG_MIN_AREA:
-                    out.append(im)
-            except ValueError:
-                continue  # 无 bbox 且无有效 OCR 文字 → 装饰图，不回显
+            if im.get("hf"):
+                continue  # 入库阶段标记的页眉/页脚固定区域图
+            if len(str(im.get("ocr_text") or "").strip()) < cls.DISPLAY_IMG_MIN_OCR_CHARS:
+                continue  # 无有效 OCR 文字 → 装饰/空白图/Logo（表格截图 OCR 出文字会自然保留）
+            bbox = str(im.get("bbox") or "")
+            if bbox:
+                try:
+                    _, y0, _, y1 = (float(v) for v in bbox.split(","))
+                    if y1 <= cls.DISPLAY_HF_TOP or y0 >= cls.DISPLAY_HF_BOTTOM:
+                        continue  # 旧数据兜底：页眉/页脚固定区域不回显
+                except ValueError:
+                    pass
+            out.append(im)
         return out
 
     @staticmethod
-    def _image_refs(chunk: dict) -> list[dict]:
-        """块内图片元数据 → 前端回显结构（去重 + 装饰图过滤；原图走 /api/knowledge/image/{id} 鉴权）"""
+    def _image_refs(chunk: dict, valid: dict[int, str] | None = None) -> list[dict]:
+        """块内图片元数据 → 前端回显结构（去重 + 装饰图过滤 + 存在性校验；原图走 /api/knowledge/image/{id} 鉴权）
+        valid: doc 内真实存在的 {image_id: 相对路径}（kb_images 表登记且文件在盘）；None 时跳过存在性校验。"""
         refs: list[dict] = []
         seen: set[int] = set()
         for im in KnowledgeService.filter_displayable_images(chunk.get("images")):
             iid = im.get("id")
             if not iid or iid in seen:
                 continue
+            if valid is not None:
+                rel = valid.get(iid)
+                if not rel or not (settings.DATA_DIR / rel).exists():
+                    continue  # 图片记录或原图文件已失效 → 直接剔除
             seen.add(iid)
             refs.append({"id": iid, "url": f"/api/knowledge/image/{iid}", "page": im.get("page")})
         return refs
 
-    def _hit_payload(self, cid: str, c: dict, score: float, doc_map: dict[int, str]) -> dict:
-        """组装单条检索结果（含位置元数据 page/header/footer 与原图引用）"""
+    def _valid_images_by_doc(self, db: Session, doc_ids: set[int]) -> dict[int, dict[int, str]]:
+        """按文档预取真实可回显的图片集合（kb_images 已登记 + 原图文件在盘），供展示层存在性校验"""
+        out: dict[int, dict[int, str]] = {}
+        for did in doc_ids:
+            m: dict[int, str] = {}
+            for im in rag_db.list_doc_images(db, did):
+                try:
+                    if (settings.DATA_DIR / im["path"]).exists():
+                        m[im["id"]] = im["path"]
+                except OSError:
+                    continue
+            out[did] = m
+        return out
+
+    def _prune_doc_images(self, db: Session, doc_id: int, parsed) -> set[int]:
+        """重建索引时的旧数据图片修复入口（不必重新解析/OCR）：
+        按"OCR 有效文字 ≥10 字且不在页眉页脚固定区域"的新口径重筛该文档已登记图片，
+        不合格的从 kb_images 删行删文件，并同步从解析缓存块引用中摘除，
+        避免旧装饰图/空白图/页眉 Logo 经重切再次进入 chunk 元数据。返回保留的 image_id 集合。"""
+        imgs = rag_db.list_doc_images(db, doc_id)
+        keep: set[int] = set()
+        drop_ids: list[int] = []
+        for im in imgs:
+            bbox = str(im.get("bbox") or "")
+            in_hf = False
+            if bbox:
+                try:
+                    _, y0, _, y1 = (float(v) for v in bbox.split(","))
+                    in_hf = y1 <= self.DISPLAY_HF_TOP or y0 >= self.DISPLAY_HF_BOTTOM
+                except ValueError:
+                    in_hf = False  # bbox 残缺时交由 OCR 文字规则判定
+            if len((im.get("ocr_text") or "").strip()) >= self.DISPLAY_IMG_MIN_OCR_CHARS and not in_hf:
+                keep.add(im["id"])
+            else:
+                drop_ids.append(im["id"])
+        if not drop_ids:
+            return keep
+        for rel in rag_db.delete_images_by_ids(db, drop_ids):
+            try:
+                (settings.DATA_DIR / rel).unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("旧装饰图文件删除失败 %s: %s", rel, e)
+        # 缓存块引用同步摘除（老缓存 ref 已回填 id 的直接按 id；缺 id 的按 key→id 映射兜底）
+        id_by_key = {Path(im["path"]).stem: im["id"] for im in imgs if im["id"] in keep}
+        removed = 0
+        for b in parsed.blocks:
+            if b.images:
+                before = len(b.images)
+                b.images = [im for im in b.images
+                            if im.get("id") in keep or id_by_key.get(im.get("key"), -1) in keep]
+                removed += before - len(b.images)
+        logger.info("重建索引图片清理 doc=%s：剔除 %d 张装饰/空白/页眉页脚图，保留 %d 张",
+                    doc_id, len(drop_ids), len(keep))
+        if removed:
+            logger.info("重建索引图片清理 doc=%s：缓存块引用摘除 %d 处", doc_id, removed)
+        return keep
+
+    def _hit_payload(self, cid: str, c: dict, score: float,
+                     doc_map: dict[int, str], vector_sim: float | None = None,
+                     valid_images: dict[int, dict[int, str]] | None = None) -> dict:
+        """组装单条检索结果（含位置元数据 page/header/footer、原图引用与真实向量余弦相似度）"""
         return {
             "id": cid,
             "seq": c.get("seq", 0),
             "text": c["text"],
+            # score：排序分（rerank 相关度或融合分），仅用于排序/过滤，不作为"检索相似度"展示口径
             "score": round(float(score), 4),
+            # vector_sim：query 与 chunk 向量的真实余弦相似度（0~1），"检索相似度"的展示口径
+            "vector_sim": None if vector_sim is None else round(float(vector_sim), 4),
             "doc_id": c["doc_id"],
             "doc_title": doc_map.get(c["doc_id"], ""),
             "section": c.get("section", ""),
@@ -834,7 +925,7 @@ class KnowledgeService:
             "page": c.get("page"),
             "header": c.get("header", "") or "",
             "footer": c.get("footer", "") or "",
-            "images": self._image_refs(c),
+            "images": self._image_refs(c, (valid_images or {}).get(c["doc_id"])),
         }
 
     @staticmethod
@@ -869,14 +960,29 @@ class KnowledgeService:
         col_count = col.count()
         res = col.query(query_embeddings=[q_vec], n_results=min(n, max(col_count, 1)), where=where)
         vec_hits: list[tuple[str, float]] = []
+        vec_sim_map: dict[str, float] = {}  # cid → 真实余弦相似度（cosine distance 补集），展示口径
         if res["ids"] and res["ids"][0]:
             for cid, dist in zip(res["ids"][0], res["distances"][0]):
-                vec_hits.append((cid, 1.0 / (1.0 + dist)))  # 距离转相似度
+                vec_hits.append((cid, 1.0 / (1.0 + dist)))  # 距离转相似度（融合归一用）
+                vec_sim_map[cid] = 1.0 - float(dist)        # cosine distance = 1 - cosine sim
 
         # 2. 融合：归一加权，合并去重
         bm25_map = {cid: s for cid, s in zip([h[0] for h in bm25_hits], self._minmax([h[1] for h in bm25_hits]))}
         vec_map = {cid: s for cid, s in zip([h[0] for h in vec_hits], self._minmax([h[1] for h in vec_hits]))}
         all_ids = list(dict.fromkeys(list(bm25_map.keys()) + list(vec_map.keys())))
+        # BM25 命中但向量未召回的块：补算 query 与 chunk 向量的余弦相似度（避免向量项缺失）
+        missing = [cid for cid in all_ids if cid not in vec_sim_map]
+        if missing:
+            try:
+                got = col.get(ids=missing, include=["embeddings"])
+                for cid, emb in zip(got.get("ids") or [], got.get("embeddings") or []):
+                    if emb is None:
+                        continue
+                    sim = _cosine_sim(q_vec, list(emb))
+                    if sim is not None:
+                        vec_sim_map[cid] = sim
+            except Exception as e:  # noqa: BLE001
+                logger.warning("补算向量相似度失败（不影响检索，仅显示为 —）: %s", e)
         fused: list[tuple[str, float]] = []
         for cid in all_ids:
             score = settings.BM25_WEIGHT * bm25_map.get(cid, 0.0) + settings.VECTOR_WEIGHT * vec_map.get(cid, 0.0)
@@ -887,21 +993,36 @@ class KnowledgeService:
         if not candidates:
             return []
 
+        # 排查日志：每条候选的原始分数（BM25 归一分 / 向量余弦 / 融合分），确认检索口径
+        logger.info(
+            "检索[%s] user=%s 候选 %d 条: %s", query[:30], user_id, len(candidates),
+            "; ".join(
+                f"{cid[:8]}… bm25={bm25_map.get(cid, 0.0):.3f} cos={vec_sim_map.get(cid, float('nan')):.4f} "
+                f"fused={score:.3f}"
+                for cid, score in candidates[:10]
+            ),
+        )
+
         # 3. 取块详情（仅当前用户的块）
         user_chunks = rag_db.all_chunks(db, user_id)
         candidate_ids = {cid for cid, _ in candidates}
         detail = {c["id"]: c for c in user_chunks if c["id"] in candidate_ids}
         cand_texts = [detail[cid]["text"] for cid, _ in candidates if cid in detail]
         doc_map = {d["id"]: d["title"] for d in rag_db.list_docs(db, user_id)}
+        # 回显图片存在性预校验（kb_images 已登记 + 原图文件在盘，失效图直接剔除）
+        valid_images = self._valid_images_by_doc(db, {c["doc_id"] for c in detail.values()})
 
         # 4. 重排精排（失败降级为融合分；用当前用户的 rerank 模型）
+        #    注意：rerank 返回的相关度分数可能极小（如 0.003），只用于排序；
+        #    "检索相似度"一律展示 vector_sim（真实余弦）
         try:
             client = get_user_llm(db, user_id)
             reranked = client.rerank(query, cand_texts, top_n=top_k)
             results = []
             for r in reranked:
                 cid = candidates[r["index"]][0]
-                results.append(self._hit_payload(cid, detail[cid], r["score"], doc_map))
+                results.append(self._hit_payload(
+                    cid, detail[cid], r["score"], doc_map, vec_sim_map.get(cid), valid_images))
             return results
         except Exception as e:  # noqa: BLE001
             logger.warning("重排失败，降级用融合分: %s", e)
@@ -909,7 +1030,8 @@ class KnowledgeService:
             for cid, score in candidates[:top_k]:
                 if cid not in detail:
                     continue
-                results.append(self._hit_payload(cid, detail[cid], score, doc_map))
+                results.append(self._hit_payload(
+                    cid, detail[cid], score, doc_map, vec_sim_map.get(cid), valid_images))
             return results
 
     # ------------------------------------------------------------------
@@ -949,6 +1071,8 @@ class KnowledgeService:
         doc_chunks: dict[int, dict[int, dict]] = {}
         for did in doc_ids:
             doc_chunks[did] = {c["seq"]: c for c in rag_db.get_doc_chunks(db, did)}
+        # 回显图片存在性预校验（合并片段时图片跨块去重合并，仍只取真实在盘的图）
+        valid_images = self._valid_images_by_doc(db, doc_ids)
 
         # 每篇文档：命中 seq 扩展窗口 → 连续区间分组
         segments: list[dict] = []
@@ -983,6 +1107,9 @@ class KnowledgeService:
                 grp_set = set(grp)
                 seg_hits = [h for h in doc_hits if int(h["seq"]) in grp_set]
                 score = max((h["score"] for h in seg_hits), default=0.0)
+                # 展示口径：片段向量相似度取成员块的最大真实余弦（与 score 的聚合方式一致）
+                seg_sims = [h.get("vector_sim") for h in seg_hits if h.get("vector_sim") is not None]
+                vector_sim = max(seg_sims) if seg_sims else None
                 merged_text = self._dedupe_join(
                     [chunks_map[k]["text"] for k in grp], join_overlap
                 )
@@ -996,7 +1123,7 @@ class KnowledgeService:
                 imgs: list[dict] = []
                 seen_img: set[int] = set()
                 for k in grp:
-                    for im in self._image_refs(chunks_map[k]):
+                    for im in self._image_refs(chunks_map[k], valid_images.get(did)):
                         if im["id"] in seen_img:
                             continue
                         seen_img.add(im["id"])
@@ -1007,6 +1134,7 @@ class KnowledgeService:
                     "section": section,
                     "text": merged_text,
                     "score": round(score, 4),
+                    "vector_sim": None if vector_sim is None else round(vector_sim, 4),
                     "doc_type": doc_hits[0]["doc_type"] if doc_hits else (rag_db.get_doc(db, did, user_id) or {}).get("doc_type", ""),
                     "page": pages[0] if pages else None,
                     "pages": pages,
@@ -1051,6 +1179,8 @@ class KnowledgeService:
             # 先清旧块
             rag_db.delete_chunks_by_doc(db, did)
             if parsed is not None:
+                # 旧数据兜底：按新图片口径重过滤（装饰/空白/页眉页脚 Logo 从 kb_images 与缓存块引用中剔除）
+                keep_img_ids = self._prune_doc_images(db, did, parsed)
                 # 结构化文档（PDF/Word）：复用解析缓存按新策略重切，OCR/图片不重跑
                 new_chunks = self._split_parsed(db, user_id, parsed, d["doc_type"])
                 # 缓存块内图片通常已带 id（首次入库时回填）；缺 id 时按已登记 kb_images 路径补映射
@@ -1062,6 +1192,8 @@ class KnowledgeService:
                         if not im.get("id") and im.get("key") in key_to_id:
                             im["id"] = key_to_id[im["key"]]
                         im.pop("key", None)
+                    # 双保险：重切结果只保留通过新口径的图片引用
+                    c["images"] = [im for im in (c.get("images") or []) if im.get("id") in keep_img_ids]
             else:
                 # 纯文本文档（粘贴/聊天记录）：旧块用单换行拼全文按当前策略重切。
                 # 单换行能让被切散的 Markdown 表格行重新连续（空行会打断表格识别）

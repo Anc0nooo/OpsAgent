@@ -19,6 +19,7 @@ RAG 知识库 - 结构化文档加载器
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -155,6 +156,8 @@ class ImageFile:
     bbox: str          # x0,y0,x1,y1
     ocr_text: str
     content_type: str
+    area_ratio: float = 0.0   # 图片面积 / 所在页面积（0~1；Word 无页尺寸为 0）
+    hf_zone: bool = False     # 是否位于页眉/页脚固定区域（上下 8% 页高，装饰 Logo 高发区）
 
 
 @dataclass
@@ -297,6 +300,60 @@ def _run_ocr_jobs(jobs: list[dict], ocr_fn: OcrFn | None,
 
 
 # ======================================================================
+# 图片源头过滤（入库前丢弃装饰图/空白图/页眉页脚 Logo，不进图片元数据）
+# ----------------------------------------------------------------------
+# 口径（满足任一条件即丢弃）：
+# 1) 面积占比 < 5% 所在页面 → 页眉 Logo、页脚装饰、小图标；
+# 2) OCR 已执行仍无有效文字（<10 字，表格截图 OCR 出表格文字会自然保留）→ 纯装饰图/背景图；
+# 3) 位于页眉/页脚固定区域（上下 8% 页高）且同图重复出现在 ≥2 页 → 固定 Logo。
+IMG_MIN_AREA_RATIO = 0.05
+IMG_MIN_OCR_CHARS = 10
+HF_ZONE_RATIO = 0.08
+HF_DUP_PAGES = 2
+
+
+def _drop_junk_images(parsed: ParsedDocument, ocr_attempted: set[str],
+                      digest_pages: dict[str, set[int]], key_digest: dict[str, str],
+                      img_dir: Path) -> None:
+    """OCR 完成后统一执行规则 2/3（规则 1 面积占比在 PDF 提取时已前置过滤）：
+    被丢弃的图片从块引用、image_files 清单移除并删除落盘文件，不进图片元数据。"""
+    drop: set[str] = set()
+    for imf in parsed.image_files:
+        # 规则 3：页眉/页脚固定区域 + 同图（字节指纹）重复出现在多页 → 固定 Logo
+        digest = key_digest.get(imf.key)
+        if imf.hf_zone and digest and len(digest_pages.get(digest) or ()) >= HF_DUP_PAGES:
+            drop.add(imf.key)
+            continue
+        # 规则 2：OCR 已执行仍无有效文字 → 装饰/空白图（空白大图无论面积一律丢弃）
+        if imf.key in ocr_attempted:
+            if len((imf.ocr_text or "").strip()) < IMG_MIN_OCR_CHARS:
+                drop.add(imf.key)
+            continue
+        # OCR 未执行（无 Key/配额尽）：无法判断内容，从严处理——
+        # 页眉页脚区域图、无位置信息（Word/无 bbox）或面积 <5% 的图一律不进元数据
+        if imf.hf_zone or imf.area_ratio < IMG_MIN_AREA_RATIO:
+            drop.add(imf.key)
+    if not drop:
+        return
+    for b in parsed.blocks:
+        if b.images:
+            b.images = [im for im in b.images if im.get("key") not in drop]
+    kept: list[ImageFile] = []
+    for imf in parsed.image_files:
+        if imf.key in drop:
+            for f in img_dir.glob(f"{imf.key}.*"):
+                try:
+                    f.unlink()
+                except OSError as e:
+                    logger.warning("无效图片落盘文件删除失败 %s: %s", f, e)
+        else:
+            kept.append(imf)
+    parsed.image_files = kept
+    if drop:
+        logger.info("图片源头过滤：丢弃 %d 张装饰/空白/页眉页脚 Logo 图 %s", len(drop), sorted(drop))
+
+
+# ======================================================================
 # PDF
 # ======================================================================
 def _init_ocr_quota() -> int:
@@ -317,6 +374,9 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
     image_files: list[ImageFile] = []
     ocr_jobs: list[dict] = []   # 延迟 OCR 任务（页循环内只收集，最后并发执行）
     ocr_quota: int = _init_ocr_quota()  # 剩余 OCR 名额（控成本/控时长；获取失败降级为 0）
+    ocr_attempted: set[str] = set()          # 已执行 OCR 的图片 key（区分"OCR 无文字"与"未 OCR"）
+    digest_pages: dict[str, set[int]] = {}   # 图片字节指纹 → 出现页集合（页眉页脚重复 Logo 检测）
+    key_digest: dict[str, str] = {}          # 图片 key → 字节指纹
 
     with pymupdf.open(stream=data, filetype="pdf") as pdf:
         total_pages = pdf.page_count
@@ -444,18 +504,30 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 if rect is not None and (rect.width < settings.OCR_MIN_IMAGE_PX
                                          or rect.height < settings.OCR_MIN_IMAGE_PX):
                     continue
+                # 规则1 前置过滤：面积占比 <5% 页面 → 页眉 Logo/页脚装饰/小图标，直接不落盘
+                page_area = ph * page.rect.width
+                area_ratio = ((rect.width * rect.height) / page_area) if (rect is not None and page_area > 0) else 0.0
+                if rect is not None and area_ratio < IMG_MIN_AREA_RATIO:
+                    continue
                 bbox = f"{rect.x0:.0f},{rect.y0:.0f},{rect.x1:.0f},{rect.y1:.0f}" if rect else ""
+                # 规则3 依据：页眉/页脚固定区域（上下 8% 页高）+ 跨页重复（后面统一判定）
+                hf_zone = rect is not None and (rect.y1 <= ph * HF_ZONE_RATIO or rect.y0 >= ph * (1 - HF_ZONE_RATIO))
                 key = f"p{page_no}_x{xref}"
                 rel_path = f"{rel_dir}/{key}.{ext}"
                 (img_dir / f"{key}.{ext}").write_bytes(img_bytes)
                 mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
-                imf = ImageFile(key, rel_path, page_no, bbox, "", mime)
+                imf = ImageFile(key, rel_path, page_no, bbox, "", mime,
+                                area_ratio=area_ratio, hf_zone=hf_zone)
                 image_files.append(imf)
-                img_ref = {"key": key, "page": page_no, "bbox": bbox, "ocr_text": ""}
+                digest = hashlib.md5(img_bytes).hexdigest()[:16]
+                key_digest[key] = digest
+                digest_pages.setdefault(digest, set()).add(page_no)
+                img_ref = {"key": key, "page": page_no, "bbox": bbox, "ocr_text": "", "hf": hf_zone}
                 host = blocks[-1] if blocks and blocks[-1].page == page_no else None
                 if ocr_fn is not None and ocr_quota and ocr_quota > 0:
                     # OCR 延迟执行：出文字拆独立 OCR 块（插回本页末尾），否则留在宿主块
                     ocr_quota -= 1
+                    ocr_attempted.add(key)
                     if host is not None:
                         host.images.append(img_ref)
                     _collect_ocr_job(
@@ -475,9 +547,11 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
     _run_ocr_jobs(ocr_jobs, ocr_fn, blocks, progress_fn=progress_fn,
                   progress_base=total_pages, progress_total=total_pages + len(ocr_jobs))
 
-    # 跨页段落续行合并（段落被分页打断的场景）
-    return ParsedDocument(kind="pdf", blocks=_merge_cross_page_paragraphs(blocks),
-                          image_files=image_files)
+    parsed = ParsedDocument(kind="pdf", blocks=_merge_cross_page_paragraphs(blocks),
+                            image_files=image_files)
+    # 源头过滤：丢弃 OCR 无文字的装饰/空白图与跨页重复的页眉页脚 Logo（不进图片元数据）
+    _drop_junk_images(parsed, ocr_attempted, digest_pages, key_digest, img_dir)
+    return parsed
 
 
 def _block_max_size(page_dict: dict, x0: float, y0: float, x1: float, y1: float) -> float:
@@ -518,14 +592,18 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
     from docx import Document as _Docx
     from docx.oxml.ns import qn
     from docx.table import Table as _Table
-    from docx.text.paragraph import Paragraph as _Paragraph
 
-    doc = _Docx(io.BytesIO(data))
     img_dir.mkdir(parents=True, exist_ok=True)
     blocks: list[Block] = []
     image_files: list[ImageFile] = []
     ocr_jobs: list[dict] = []
     ocr_quota: int = _init_ocr_quota()
+    ocr_attempted: set[str] = set()          # 已执行 OCR 的图片 key（区分"OCR 无文字"与"未 OCR"）
+    digest_pages: dict[str, set[int]] = {}   # 图片字节指纹 → 出现页集合（Word 无页码，仅占位统一口径）
+    key_digest: dict[str, str] = {}          # 图片 key → 字节指纹
+    from docx.text.paragraph import Paragraph as _Paragraph
+
+    doc = _Docx(io.BytesIO(data))
 
     # 页眉页脚（Word 按 section；首页/奇偶页简化取第一节可用文本）
     header_text = footer_text = ""
@@ -557,11 +635,16 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
             key = f"img_{len(image_files) + 1}"
             rel_path = f"{rel_dir}/{key}.{ext}"
             (img_dir / f"{key}.{ext}").write_bytes(blob)
-            imf = ImageFile(key, rel_path, None, "", "", ctype)
+            imf = ImageFile(key, rel_path, None, "", "", ctype,
+                            area_ratio=0.0, hf_zone=False)  # Word 无页尺寸：面积/页眉页脚区域不可判定
             image_files.append(imf)
+            digest = hashlib.md5(blob).hexdigest()[:16]
+            key_digest[key] = digest
+            digest_pages.setdefault(digest, set()).add(len(image_files))  # Word 无页码，指纹占位防误判重复
             ref = {"key": key, "page": None, "bbox": "", "ocr_text": ""}
             if ocr_fn is not None and ocr_quota > 0:
                 ocr_quota -= 1
+                ocr_attempted.add(key)
                 _collect_ocr_job(
                     ocr_jobs, kind="inline", page_no=None,
                     path=str(img_dir / f"{key}.{ext}"), mime=ctype,
@@ -596,6 +679,7 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
                     if ocr_fn is not None and ocr_quota and ocr_quota > 0 and imf is not None:
                         ext = "jpeg" if "jpeg" in (imf.content_type or "") else "png"
                         ocr_quota -= 1
+                        ocr_attempted.add(ref["key"])
                         _collect_ocr_job(
                             ocr_jobs, kind="standalone", page_no=None,
                             path=str(img_dir / f"{ref['key']}.{ext}"), mime=imf.content_type or "image/png",
@@ -614,7 +698,10 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
     # ---- 统一并发 OCR ----
     _run_ocr_jobs(ocr_jobs, ocr_fn, blocks)
 
-    return ParsedDocument(kind="docx", blocks=blocks, image_files=image_files)
+    parsed = ParsedDocument(kind="docx", blocks=blocks, image_files=image_files)
+    # 源头过滤：丢弃 OCR 无文字的装饰/空白图（Word 无 bbox，从严按 OCR 文字判定）
+    _drop_junk_images(parsed, ocr_attempted, digest_pages, key_digest, img_dir)
+    return parsed
 
 
 # ======================================================================

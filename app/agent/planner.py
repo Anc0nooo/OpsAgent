@@ -135,15 +135,12 @@ def _plan_answer(result: dict) -> str:
 
 def _evaluation(result: dict, rag_sources: list[dict] | None = None,
                 seg_stats: dict | None = None) -> dict | None:
-    """回答质量评估（口径统一版，2026-10）：
+    """回答质量评估（精简三项口径：检索相似度 / 知识库命中度 / 幻觉风险）：
     - source_coverage 命中度：客观口径 = 相似度≥0.5 的注入片段数 / 注入片段总数（如 "3/5 段"），
       取自检索统计 seg_stats（context.HIT_RELEVANT_THRESHOLD），不由模型自报；无片段时空串
-    - accuracy 准确度：模型按 prompt 输出 fact_check{supported,total}（回答事实点在引用片段
-      原文中的支撑计数），后端校验数值合法后映射 高(全支撑)/中(≥60%)/低；未输出或非法时空串
-      （前端显示 —），禁止出现无依据的精确百分比
     - hallucination_risk 幻觉风险：模型自评与检索事实联动兜底——最高来源相似度 <0.5 或
       无有效引用时强制至少 "中"（低相似度/无引用下不允许显示 "低"）
-    三项全空时返回 None（前端不渲染评估卡片，如闲聊直答）。
+    两项全空时返回 None（前端不渲染评估卡片，如闲聊直答）。
     """
     def norm_level(v: Any) -> str:
         s = str(v or "").strip()
@@ -156,48 +153,28 @@ def _evaluation(result: dict, rag_sources: list[dict] | None = None,
         relevant = min(int(seg_stats.get("relevant") or 0), total)
         cov = f"{relevant}/{total} 段"
 
-    # 准确度：fact_check 数值校验 → 分层（模型不按格式输出时留空，显示 —）
-    acc = ""
-    fc = result.get("fact_check")
-    if isinstance(fc, dict):
-        try:
-            fc_total = int(fc.get("total") or 0)
-            fc_supported = int(fc.get("supported") or 0)
-        except (TypeError, ValueError):
-            fc_total = fc_supported = 0
-        if fc_total > 0 and 0 <= fc_supported <= fc_total:
-            ratio = fc_supported / fc_total
-            acc = "高" if ratio >= 0.999 else ("中" if ratio >= 0.6 else "低")
-
-    # 幻觉风险：自评 + 相似度联动兜底
-    # 仅在有检索来源数据时兜底（rag_sources=None 表示该路径未做来源检索，保持模型自评；
-    # 空列表=检索过但无有效引用，或最高相似度<0.5 → 至少 "中"）
     risk = norm_level(result.get("hallucination_risk"))
-    if not (cov or acc or risk):
+    if not (cov or risk):
         return None  # 闲聊/无任何可评估信息 → 不渲染卡片
+
+    # 幻觉风险联动：仅在有检索来源数据时兜底（rag_sources=None 表示该路径未做来源检索，保持自评；
+    # 无有效相似度或最高相似度<0.5 → 至少 "中"）
     if rag_sources is not None:
-        top_sim = _confidence(rag_sources)["score"] if rag_sources else 0.0
-        if not rag_sources or top_sim < 0.5:
+        sims = []
+        for s in rag_sources:
+            v = s.get("similarity")
+            try:
+                fv = float(v)
+                if fv == fv:  # NaN 检查
+                    sims.append(fv)
+            except (TypeError, ValueError):
+                continue
+        top_sim = max(sims) if sims else 0.0
+        if not sims or top_sim < 0.5:
             _rank = {"低": 0, "中": 1, "高": 2}
             if _rank.get(risk, 0) < _rank["中"]:
                 risk = "中"
-    return {"source_coverage": cov, "accuracy": acc, "hallucination_risk": risk}
-
-
-def _confidence(rag_sources: list[dict] | None) -> dict:
-    """
-    真实可信度（来自检索链路的相似度分数，非模型自报）：
-    取全部来源中的最高相似度（0~1），映射为 高/中/低 分层。
-    阈值：≥0.75 高（命中充分）；≥0.45 中（部分命中）；其余 低（弱命中/未命中）。
-    """
-    top = 0.0
-    for s in rag_sources or []:
-        try:
-            top = max(top, float(s.get("similarity") or 0.0))
-        except (TypeError, ValueError):
-            continue
-    level = "高" if top >= 0.75 else ("中" if top >= 0.45 else "低")
-    return {"score": round(top, 2), "level": level}
+    return {"source_coverage": cov, "hallucination_risk": risk}
 
 
 class Planner:
@@ -504,12 +481,11 @@ class Planner:
             # 元信息随回答落库（历史恢复时重渲染来源/相似度/可信度/幻觉风险）
             store.add_message(db, sid, "assistant", content, meta={
                 "sources": rag_sources, "evaluation": evaluation,
-                "confidence": _confidence(rag_sources),
             })
             db.commit()
             yield {"type": "done", "session_id": sid, "state": AgentState.QUERY_PENDING.value,
                    "need_query": True, "query_round": new_round, "pending_query": pending,
-                   "sources": rag_sources, "evaluation": evaluation, "confidence": _confidence(rag_sources)}
+                   "sources": rag_sources, "evaluation": evaluation}
             return
 
         # ④ 正文：切片模拟流式打字机（单次 structured 已生成 answer，前端逐块呈现）
@@ -527,15 +503,13 @@ class Planner:
         # 元信息随回答落库（历史恢复时重渲染来源/图片/相似度/可信度/幻觉风险）
         store.add_message(db, sid, "assistant", content, meta={
             "sources": rag_sources, "evaluation": evaluation,
-            "confidence": _confidence(rag_sources),
         })
         store.update_session(db, sid, user_id, state=AgentState.DONE.value, clear_pending=True,
                              query_round=session["query_round"] or 0)
         db.commit()
         yield {"type": "done", "session_id": sid, "state": AgentState.DONE.value,
                "need_query": False, "query_round": session["query_round"] or 0,
-               "sections": sections, "sources": rag_sources, "evaluation": evaluation,
-               "confidence": _confidence(rag_sources)}
+               "sections": sections, "sources": rag_sources, "evaluation": evaluation}
 
     # ------------------------------------------------------------------
     # 内部工具

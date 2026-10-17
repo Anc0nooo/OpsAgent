@@ -25,27 +25,15 @@ export interface ChatEvent {
   /** done 事件附加：四段总结卡片 / 引用来源（阶段 5） */
   sections?: SummarySections
   sources?: SourceRef[]
-  /** done 事件附加：回答质量自评（仅工作类问题产出；闲聊无此字段） */
+  /** done 事件附加：回答质量评估（仅工作类问题产出；闲聊无此字段） */
   evaluation?: AnswerEvaluation
-  /** done 事件附加：真实可信度（来自检索相似度分数分层，非模型自报；仅工作类产出） */
-  confidence?: ConfidenceInfo
 }
 
-/** 真实可信度：检索最高相似度分数 + 分层（高/中/低） */
-export interface ConfidenceInfo {
-  /** 全部来源中的最高相似度（0~1，混合检索融合分） */
-  score: number
-  /** 分层：高（≥0.75）/ 中（≥0.45）/ 低 */
-  level: string
-}
-
-/** 回答质量评估（LLM 自评，随工作类回答的 done 事件返回） */
+/** 回答质量评估（精简三项：相似度来自 sources、命中度+幻觉风险在此；随工作类回答的 done 事件返回） */
 export interface AnswerEvaluation {
-  /** 知识库命中度：高 / 中 / 低 */
+  /** 知识库命中度：客观口径 "M/N 段"（相似度≥0.5 的注入片段数/注入片段总数） */
   source_coverage: string
-  /** 回答准确度百分比字符串，如 "85%" */
-  accuracy: string
-  /** 幻觉风险：低 / 中 / 高 */
+  /** 幻觉风险：低 / 中 / 高（相似度<0.5 或引用缺失时至少为 中） */
   hallucination_risk: string
 }
 
@@ -53,7 +41,7 @@ export interface AnswerEvaluation {
 export interface SourceRef {
   doc_id: number
   doc_title: string
-  /** 该文档命中的最高相似度（0~1，混合检索融合分） */
+  /** 该文档命中的最高真实向量余弦相似度（0~1）；检索链路无有效相似度时为 undefined（显示 —） */
   similarity?: number
   /** 命中页码列表（纯文本文档为空数组） */
   pages?: number[]
@@ -81,11 +69,10 @@ export interface PendingQuery {
   round: number
 }
 
-/** 消息元信息（assistant 回答落库的 sources/evaluation/confidence；老数据为 null，前端降级不展示） */
+/** 消息元信息（assistant 回答落库的 sources/evaluation；老数据为 null，前端降级不展示） */
 export interface MessageMeta {
   sources?: SourceRef[]
   evaluation?: AnswerEvaluation
-  confidence?: ConfidenceInfo
 }
 
 /** 会话详情（历史恢复用） */

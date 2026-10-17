@@ -286,3 +286,15 @@ def delete_images_by_doc(db: Session, doc_id: int) -> list[str]:
         db.delete(r)
     db.flush()
     return paths
+
+
+def delete_images_by_ids(db: Session, ids: list[int]) -> list[str]:
+    """按 id 删除图片记录（旧数据装饰图清理），返回文件相对路径列表（调用方负责删盘）"""
+    if not ids:
+        return []
+    rows = db.query(KbImage).filter(KbImage.id.in_(ids)).all()
+    paths = [r.path for r in rows]
+    for r in rows:
+        db.delete(r)
+    db.flush()
+    return paths

@@ -6,13 +6,13 @@
  * - 挂起态：SQL 卡片提示条（轮次 + 复制 SQL + 脱敏提醒），输入框切换为"回传结果"
  * - 会话策略：每次进入对话页默认新对话窗口；侧边栏/历史页跳转 ?session=xxx 时才加载指定会话
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { getHealth, type HealthInfo } from '../api'
 import { getSettingsStatus, type SettingsStatus } from '../api/settings'
-import { exportFile, loadSession, saveSessionKnowledge, streamChat, type AnswerEvaluation, type ConfidenceInfo, type PendingQuery, type SourceRef, type SummarySections } from '../api/chat'
+import { exportFile, loadSession, saveSessionKnowledge, streamChat, type AnswerEvaluation, type PendingQuery, type SourceRef, type SummarySections } from '../api/chat'
 import { kbImageUrl } from '../api/knowledge'
 import DocViewDialog from '../components/DocViewDialog.vue'
 
@@ -28,10 +28,8 @@ interface ChatMessage {
   sections?: SummarySections
   /** 引用来源文档（可点击查看，仅流式 done 事件携带） */
   sources?: SourceRef[]
-  /** 回答质量自评卡片（仅工作类问题携带；闲聊无此字段） */
+  /** 回答质量评估卡片（仅工作类问题携带；闲聊无此字段） */
   evaluation?: AnswerEvaluation
-  /** 真实可信度（检索最高相似度分数 + 分层；仅工作类问题携带） */
-  confidence?: ConfidenceInfo
   /** 后端分类错误码（error 事件携带） */
   error_code?: string
   /** 方案摘要面板是否展开（默认 false，点按钮才展开） */
@@ -83,6 +81,9 @@ function openKbImage(url: string) {
   window.open(kbImageUrl(url), '_blank')
 }
 
+/** 加载失败的知识库原图 id（error 事件置入，渲染占位而不是深色空白块；会话级去重） */
+const failedKbImgs = reactive(new Set<number>())
+
 // DOM 引用：消息滚动容器 / 输入框
 const scrollRef = ref<HTMLElement | null>(null)
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
@@ -114,9 +115,18 @@ function levelTone(level: string | undefined, goodIsHigh: boolean): string {
   if (level === bad) return 'bad'
   return ''
 }
-/** 准确度配色（口径统一后为 高/中/低；老数据可能是 "95%" 这类百分比，一律显示 — 不再沿用） */
-function accuracyText(acc: string | undefined): string {
-  return ['高', '中', '低'].includes(acc || '') ? (acc as string) : '—'
+/** 检索相似度（三项指标之一）：全部来源中的最高真实余弦相似度；无有效值返回 null（显示 —） */
+function maxSim(sources?: SourceRef[]): number | null {
+  let top: number | null = null
+  for (const s of sources || []) {
+    if (typeof s.similarity === 'number' && s.similarity === s.similarity) {
+      top = top === null ? s.similarity : Math.max(top, s.similarity)
+    }
+  }
+  return top
+}
+function fmtSim(v: number | null): string {
+  return v === null ? '—' : v.toFixed(2)
 }
 /** 命中度配色：新口径 "M/N 段"（按比率 ≥0.7/≥0.45 分色，与可信度阈值一致）；老口径 高/中/低 直接分色 */
 function coverageTone(cov: string | undefined): string {
@@ -194,7 +204,6 @@ async function handleSend() {
     if (done.sources) aiMsg.sources = done.sources
     // 回答质量自评卡片 + 真实可信度（闲聊直答的 done 事件不含这些字段，自动不显示）
     if (done.evaluation) aiMsg.evaluation = done.evaluation
-    if (done.confidence) aiMsg.confidence = done.confidence
   } catch (e) {
     const err = e as Error & { error_code?: string; detail?: string }
     aiMsg.status = ''
@@ -383,7 +392,7 @@ onMounted(async () => {
         role: m.role,
         content: m.content,
         ...(m.role === 'assistant' && m.meta
-          ? { sources: m.meta.sources, evaluation: m.meta.evaluation, confidence: m.meta.confidence }
+          ? { sources: m.meta.sources, evaluation: m.meta.evaluation }
           : {}),
       }))
       if (detail.state === 'QUERY_PENDING' && detail.pending_query) {
@@ -439,7 +448,7 @@ async function onSidebarLoadSession(e: Event) {
       role: m.role,
       content: m.content,
       ...(m.role === 'assistant' && m.meta
-        ? { sources: m.meta.sources, evaluation: m.meta.evaluation, confidence: m.meta.confidence }
+        ? { sources: m.meta.sources, evaluation: m.meta.evaluation }
         : {}),
     }))
     if (detail2.state === 'QUERY_PENDING' && detail2.pending_query) {
@@ -518,30 +527,18 @@ watch(() => messages.value.length, scrollToBottom)
                   <div class="s-card-body md-body" v-html="renderMd(c.body)" />
                 </details>
               </div>
-              <!-- 回答质量评估卡片（真实检索指标 + LLM 自评；闲聊两者皆无，不显示） -->
-              <div v-if="(m.evaluation || m.confidence) && !m.streaming" class="eval-card">
+              <!-- 回答质量评估卡片（精简三项：检索相似度/命中度/幻觉风险；闲聊无来源无评估，不显示） -->
+              <div v-if="(m.evaluation || (m.sources && m.sources.length)) && !m.streaming" class="eval-card">
                 <div class="eval-title">📊 回答质量评估</div>
                 <div class="eval-metrics">
                   <div class="eval-metric">
                     <span class="eval-label">检索相似度</span>
-                    <span class="eval-value">{{ m.confidence ? m.confidence.score.toFixed(2) : '—' }}</span>
-                  </div>
-                  <div class="eval-metric">
-                    <span class="eval-label">可信度</span>
-                    <span class="eval-value" :class="levelTone(m.confidence?.level || '', true)">
-                      {{ m.confidence?.level || '—' }}
-                    </span>
+                    <span class="eval-value">{{ fmtSim(maxSim(m.sources)) }}</span>
                   </div>
                   <div class="eval-metric">
                     <span class="eval-label">知识库命中度</span>
                     <span class="eval-value" :class="coverageTone(m.evaluation?.source_coverage)">
                       {{ m.evaluation?.source_coverage || '—' }}
-                    </span>
-                  </div>
-                  <div class="eval-metric">
-                    <span class="eval-label">回答准确度</span>
-                    <span class="eval-value" :class="levelTone(accuracyText(m.evaluation?.accuracy), true)">
-                      {{ accuracyText(m.evaluation?.accuracy) }}
                     </span>
                   </div>
                   <div class="eval-metric">
@@ -563,19 +560,22 @@ watch(() => messages.value.length, scrollToBottom)
                   @click="openSource(s)"
                 >📄 {{ s.doc_title }}<span v-if="sourcePageText(s)" class="source-page">（{{ sourcePageText(s) }}</span><span v-if="s.similarity != null" class="source-page"> · 相似度 {{ s.similarity.toFixed(2) }}</span><span v-if="sourcePageText(s) || s.similarity != null" class="source-page">）</span></a>
               </div>
-              <!-- 命中知识库原图回显 -->
+              <!-- 命中知识库原图回显（列表为空时整块不渲染；加载失败显示占位而非空白块） -->
               <div
                 v-if="sourceImages(m.sources).length && !m.streaming"
                 class="source-images"
               >
-                <img
-                  v-for="im in sourceImages(m.sources)"
-                  :key="im.id"
-                  :src="kbImageUrl(im.url)"
-                  :title="im.page ? `第${im.page}页原图，点击查看` : '原图，点击查看'"
-                  loading="lazy"
-                  @click="openKbImage(im.url)"
-                />
+                <template v-for="im in sourceImages(m.sources)" :key="im.id">
+                  <img
+                    v-if="!failedKbImgs.has(im.id)"
+                    :src="kbImageUrl(im.url)"
+                    :title="im.page ? `第${im.page}页原图，点击查看` : '原图，点击查看'"
+                    loading="lazy"
+                    @click="openKbImage(im.url)"
+                    @error="failedKbImgs.add(im.id)"
+                  />
+                  <div v-else class="img-fallback">图片加载失败</div>
+                </template>
               </div>
             </div>
           </div>
@@ -1274,6 +1274,20 @@ watch(() => messages.value.length, scrollToBottom)
 .source-images img:hover {
   transform: scale(1.03);
   border-color: var(--primary);
+}
+/* 图片加载失败占位（与缩略图同尺寸，避免布局跳动） */
+.img-fallback {
+  height: 110px;
+  max-width: 180px;
+  min-width: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--text-sub);
+  font-size: 12px;
+  background: var(--bg);
 }
 .send-btn.enabled:hover {
   filter: brightness(1.08);
