@@ -299,6 +299,15 @@ def _run_ocr_jobs(jobs: list[dict], ocr_fn: OcrFn | None,
 # ======================================================================
 # PDF
 # ======================================================================
+def _init_ocr_quota() -> int:
+    """读取 OCR 名额配置；获取失败降级为 0（本次跳过 OCR，仅提取原图，不阻断解析）。"""
+    try:
+        return int(getattr(settings, "OCR_MAX_IMAGES_PER_DOC", 0))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("OCR 配额配置读取失败，本次解析跳过 OCR（不阻断入库）: %s", e)
+        return 0
+
+
 def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                  ocr_fn: OcrFn | None, progress_fn: ProgressFn = None) -> ParsedDocument:
     import pymupdf
@@ -307,7 +316,7 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
     blocks: list[Block] = []
     image_files: list[ImageFile] = []
     ocr_jobs: list[dict] = []   # 延迟 OCR 任务（页循环内只收集，最后并发执行）
-    ocr_quota = settings.OCR_MAX_IMAGES_PER_DOC  # 剩余 OCR 名额（控成本/控时长）
+    ocr_quota: int = _init_ocr_quota()  # 剩余 OCR 名额（控成本/控时长；获取失败降级为 0）
 
     with pymupdf.open(stream=data, filetype="pdf") as pdf:
         total_pages = pdf.page_count
@@ -326,7 +335,7 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
             # ---- 扫描件：整页几乎无文本层 → 渲染整页落盘，稍后并发 OCR ----
             plain_text = page.get_text().strip()
             if len(plain_text) < settings.SCANNED_PAGE_MIN_CHARS:
-                if ocr_fn is not None and ocr_quota > 0:
+                if ocr_fn is not None and ocr_quota and ocr_quota > 0:
                     try:
                         pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
                         key = f"p{page_no}_scan"
@@ -444,7 +453,7 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 image_files.append(imf)
                 img_ref = {"key": key, "page": page_no, "bbox": bbox, "ocr_text": ""}
                 host = blocks[-1] if blocks and blocks[-1].page == page_no else None
-                if ocr_fn is not None and ocr_quota > 0:
+                if ocr_fn is not None and ocr_quota and ocr_quota > 0:
                     # OCR 延迟执行：出文字拆独立 OCR 块（插回本页末尾），否则留在宿主块
                     ocr_quota -= 1
                     if host is not None:
@@ -516,7 +525,7 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
     blocks: list[Block] = []
     image_files: list[ImageFile] = []
     ocr_jobs: list[dict] = []
-    ocr_quota = settings.OCR_MAX_IMAGES_PER_DOC
+    ocr_quota: int = _init_ocr_quota()
 
     # 页眉页脚（Word 按 section；首页/奇偶页简化取第一节可用文本）
     header_text = footer_text = ""
@@ -584,7 +593,7 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
                     if host is not None:
                         host.images.append(ref)
                     imf = next((x for x in image_files if x.key == ref["key"]), None)
-                    if ocr_fn is not None and ocr_quota > 0 and imf is not None:
+                    if ocr_fn is not None and ocr_quota and ocr_quota > 0 and imf is not None:
                         ext = "jpeg" if "jpeg" in (imf.content_type or "") else "png"
                         ocr_quota -= 1
                         _collect_ocr_job(
