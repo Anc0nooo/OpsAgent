@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from app.config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 # OCR 回调：(图片字节, mime) -> 识别文字（无文字返回 ""）；加载器不关心用哪个模型
@@ -261,7 +263,6 @@ def _run_ocr_jobs(jobs: list[dict], ocr_fn: OcrFn | None,
     """
     if not jobs or ocr_fn is None:
         return 0
-    from app.config.settings import settings
 
     def work(job: dict) -> str:
         try:
@@ -301,8 +302,6 @@ def _run_ocr_jobs(jobs: list[dict], ocr_fn: OcrFn | None,
 def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                  ocr_fn: OcrFn | None, progress_fn: ProgressFn = None) -> ParsedDocument:
     import pymupdf
-
-    from app.config.settings import settings
 
     img_dir.mkdir(parents=True, exist_ok=True)
     blocks: list[Block] = []
@@ -644,8 +643,6 @@ def parse_file(data: bytes, filename: str, user_id: int, doc_id: int,
                ocr_fn: OcrFn | None = None, progress_fn: ProgressFn = None) -> ParsedDocument:
     """按扩展名解析上传文件。rel_dir 为相对 DATA_DIR 的图片目录。
     progress_fn(done, total)：PDF 按页、Word 按元素推进，供解析阶段进度展示。"""
-    from app.config.settings import settings
-
     lower = filename.lower()
     rel_dir = f"images/user_{user_id}/doc_{doc_id}"
     img_dir = settings.IMAGES_DIR / f"user_{user_id}" / f"doc_{doc_id}"
