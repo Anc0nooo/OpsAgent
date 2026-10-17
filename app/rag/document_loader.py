@@ -529,6 +529,7 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
 
     def paragraph_images(p: _Paragraph) -> list[dict]:
         """提取段内图片：落盘 + 登记 ImageFile，OCR 延迟并发（inline 任务只回填元数据）"""
+        nonlocal ocr_quota  # 内部有 -= 赋值，必须声明引用外层名额计数，否则按局部变量处理触发 UnboundLocalError
         refs: list[dict] = []
         try:
             blips = p._p.findall(".//" + qn("a:blip"))
