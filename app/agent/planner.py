@@ -103,11 +103,17 @@ def _codeblock_forbid_hint(level: int, explicit_sql: bool = False) -> str:
     return ""
 
 
-def _slice_text(text: str, size: int = 80) -> list[str]:
-    """把长文本切成小块，模拟流式打字机增量（LLM 已一次生成 plan，前端仍逐块呈现）"""
+def _slice_text(text: str, size: int = 24) -> list[str]:
+    """把长文本切成小块，模拟流式打字机增量（LLM 已一次生成 plan，前端仍逐块呈现）。
+    块大小 24 字 ≈ 一次视觉增量；配合发送间隔 _DELTA_INTERVAL 形成打字节奏。"""
     if not text:
         return []
     return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+# 模拟流式的 delta 发送间隔（秒）：过小仍会"一坨弹出"，过大回答太慢；
+# 3000 字回答 ≈ 125 块 × 30ms ≈ 3.8s 输出完，节奏自然
+_DELTA_INTERVAL = 0.03
 
 
 def _friendly_error(error_code: str, raw: str) -> str:
@@ -127,20 +133,54 @@ def _plan_answer(result: dict) -> str:
     return str(result.get("answer") or result.get("plan") or "").strip()
 
 
-def _evaluation(result: dict) -> dict | None:
-    """
-    从结构化结果提取回答质量自评（LLM 自报）。
-    三项全空/无法识别时返回 None（前端不渲染评估卡片，如闲聊直答）。
+def _evaluation(result: dict, rag_sources: list[dict] | None = None,
+                seg_stats: dict | None = None) -> dict | None:
+    """回答质量评估（口径统一版，2026-10）：
+    - source_coverage 命中度：客观口径 = 相似度≥0.5 的注入片段数 / 注入片段总数（如 "3/5 段"），
+      取自检索统计 seg_stats（context.HIT_RELEVANT_THRESHOLD），不由模型自报；无片段时空串
+    - accuracy 准确度：模型按 prompt 输出 fact_check{supported,total}（回答事实点在引用片段
+      原文中的支撑计数），后端校验数值合法后映射 高(全支撑)/中(≥60%)/低；未输出或非法时空串
+      （前端显示 —），禁止出现无依据的精确百分比
+    - hallucination_risk 幻觉风险：模型自评与检索事实联动兜底——最高来源相似度 <0.5 或
+      无有效引用时强制至少 "中"（低相似度/无引用下不允许显示 "低"）
+    三项全空时返回 None（前端不渲染评估卡片，如闲聊直答）。
     """
     def norm_level(v: Any) -> str:
         s = str(v or "").strip()
         return s if s in ("高", "中", "低") else ""
 
-    cov = norm_level(result.get("source_coverage"))
+    # 命中度：客观检索统计（"相关片段/总片段"）
+    cov = ""
+    total = int((seg_stats or {}).get("total") or 0)
+    if total > 0:
+        relevant = min(int(seg_stats.get("relevant") or 0), total)
+        cov = f"{relevant}/{total} 段"
+
+    # 准确度：fact_check 数值校验 → 分层（模型不按格式输出时留空，显示 —）
+    acc = ""
+    fc = result.get("fact_check")
+    if isinstance(fc, dict):
+        try:
+            fc_total = int(fc.get("total") or 0)
+            fc_supported = int(fc.get("supported") or 0)
+        except (TypeError, ValueError):
+            fc_total = fc_supported = 0
+        if fc_total > 0 and 0 <= fc_supported <= fc_total:
+            ratio = fc_supported / fc_total
+            acc = "高" if ratio >= 0.999 else ("中" if ratio >= 0.6 else "低")
+
+    # 幻觉风险：自评 + 相似度联动兜底
+    # 仅在有检索来源数据时兜底（rag_sources=None 表示该路径未做来源检索，保持模型自评；
+    # 空列表=检索过但无有效引用，或最高相似度<0.5 → 至少 "中"）
     risk = norm_level(result.get("hallucination_risk"))
-    acc = str(result.get("accuracy") or "").strip()
-    if not (cov or risk or acc):
-        return None
+    if not (cov or acc or risk):
+        return None  # 闲聊/无任何可评估信息 → 不渲染卡片
+    if rag_sources is not None:
+        top_sim = _confidence(rag_sources)["score"] if rag_sources else 0.0
+        if not rag_sources or top_sim < 0.5:
+            _rank = {"低": 0, "中": 1, "高": 2}
+            if _rank.get(risk, 0) < _rank["中"]:
+                risk = "中"
     return {"source_coverage": cov, "accuracy": acc, "hallucination_risk": risk}
 
 
@@ -408,7 +448,8 @@ class Planner:
 
         # RAG 检索（同步检索 + 重排，放线程池；流式版带来源记录）
         yield {"type": "status", "stage": "rag", "text": "检索知识库…"}
-        rag_context, rag_sources = await asyncio.to_thread(build_rag_context_detailed, db, user_id, rag_query)
+        rag_context, rag_sources, seg_stats = await asyncio.to_thread(
+            build_rag_context_detailed, db, user_id, rag_query)
 
         # ① 单次 structured 调用：判断 need_query + 生成正文（prompt v2，省 token）
         yield {"type": "status", "stage": "analyze", "text": "分析问题…"}
@@ -444,8 +485,9 @@ class Planner:
                         need_query = False
                         result["answer"] = _plan_answer(result) + f"\n\n> 注：自动生成的 SQL 未通过只读校验（{guard.reason}），请人工编写查询。"
 
-        # 回答质量自评（LLM 结构化输出自报；闲聊直答路径不产出该字段，前端自动不渲染卡片）
-        evaluation = _evaluation(result)
+        # 回答质量评估（命中度=客观检索统计；准确度=fact_check 规则化；幻觉风险带相似度联动兜底；
+        # 闲聊直答路径无 seg_stats 且无自评字段，返回 None，前端自动不渲染卡片）
+        evaluation = _evaluation(result, rag_sources, seg_stats)
 
         # ③ 挂起：answer + SQL 卡片 + 隐私提示
         if need_query:
@@ -456,7 +498,9 @@ class Planner:
             )
             store.update_session(db, sid, user_id, state=AgentState.QUERY_PENDING.value,
                                  pending_query=pending, query_round=new_round)
-            yield {"type": "delta", "content": content}
+            for chunk in _slice_text(content, size=40):
+                yield {"type": "delta", "content": chunk}
+                await asyncio.sleep(_DELTA_INTERVAL)
             # 元信息随回答落库（历史恢复时重渲染来源/相似度/可信度/幻觉风险）
             store.add_message(db, sid, "assistant", content, meta={
                 "sources": rag_sources, "evaluation": evaluation,
@@ -475,6 +519,8 @@ class Planner:
             content += "\n\n（已达查询轮次上限，以上基于现有信息收敛输出最终方案）"
         for chunk in _slice_text(content):
             yield {"type": "delta", "content": chunk}
+            # 节奏控制：无间隔时 async generator 一个 tick 内发完全部 SSE 帧，前端表现为整段弹出
+            await asyncio.sleep(_DELTA_INTERVAL)
         # 结果输出：方案末尾附加引用来源 + 四段总结结构（供前端卡片与导出）
         content = attach_sources(content, rag_sources)
         sections = build_summary_sections(content)

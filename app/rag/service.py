@@ -785,12 +785,34 @@ class KnowledgeService:
     # ------------------------------------------------------------------
     # 检索（混合召回 + 重排，按用户隔离）
     # ------------------------------------------------------------------
+    # ---- 回显图片过滤阈值：只展示"OCR 含有效文字"或"面积 >5% 页面"的图 ----
+    # 装饰图/Logo/背景空白图通常两者都不满足；入库元数据保留，仅过滤展示层
+    DISPLAY_IMG_MIN_OCR_CHARS = 10               # OCR 有效文字最少字符数
+    DISPLAY_IMG_MIN_AREA = 0.05 * 595 * 842      # ≈25060 pt²，按 A4 纵向页面 5% 面积近似
+
+    @classmethod
+    def filter_displayable_images(cls, images: list[dict] | None) -> list[dict]:
+        """过滤不回显的图片：OCR 文字 ≥10 字（有实质内容）或面积 >5% 页面（正文插图），
+        其余（装饰图/Logo/背景空白图）不进入回显列表。bbox/ocr_text 缺失的按装饰图处理。"""
+        out: list[dict] = []
+        for im in images or []:
+            if len(str(im.get("ocr_text") or "").strip()) >= cls.DISPLAY_IMG_MIN_OCR_CHARS:
+                out.append(im)
+                continue
+            try:
+                x0, y0, x1, y1 = (float(v) for v in str(im.get("bbox") or "").split(","))
+                if (x1 - x0) * (y1 - y0) > cls.DISPLAY_IMG_MIN_AREA:
+                    out.append(im)
+            except ValueError:
+                continue  # 无 bbox 且无有效 OCR 文字 → 装饰图，不回显
+        return out
+
     @staticmethod
     def _image_refs(chunk: dict) -> list[dict]:
-        """块内图片元数据 → 前端回显结构（去重；原图走 /api/knowledge/image/{id} 鉴权）"""
+        """块内图片元数据 → 前端回显结构（去重 + 装饰图过滤；原图走 /api/knowledge/image/{id} 鉴权）"""
         refs: list[dict] = []
         seen: set[int] = set()
-        for im in chunk.get("images") or []:
+        for im in KnowledgeService.filter_displayable_images(chunk.get("images")):
             iid = im.get("id")
             if not iid or iid in seen:
                 continue

@@ -116,15 +116,16 @@ PLAN_PROMPT = """你是医院信息科运维工程师的 AI 助手，请基于�
   "sql_purpose": "挂起查询 SQL 的用途说明（need_query=true 时必填，否则空串）",
   "answer": "回答正文 markdown：结论/思路 → 步骤 → 完整SQL代码块（用户要 SQL 时）→ 引用来源（有则列文档名；标注了页码的写成「📄《文档名》第X页」）→ 风险提示",
   "source_coverage": "知识库命中度：高/中/低",
-  "accuracy": "回答准确度百分比，如 90%",
+  "fact_check": {"supported": 0, "total": 0},
   "hallucination_risk": "幻觉风险：低/中/高"
 }}
 
-【回答质量自评规则】（source_coverage / accuracy / hallucination_risk 三项必填）：
-- rag_context 有明确答案且回答完全基于它 → source_coverage="高", accuracy≥90%, hallucination_risk="低"
-- rag_context 有部分答案，回答结合了通用运维经验 → source_coverage="中", accuracy 取 70%~85%, hallucination_risk="中"
-- rag_context 无命中，回答主要靠模型推测 → source_coverage="低", accuracy≤60%, hallucination_risk="高"
-- accuracy 输出百分数字符串（如 "85%"）；自评要诚实，不要虚高；闲聊/寒暄场景三项输出空串"""
+【回答质量自评规则】（source_coverage / fact_check / hallucination_risk 三项必填，禁止输出 accuracy 百分比）：
+- source_coverage / hallucination_risk 输出 "高/中/低"；闲聊/寒暄场景三项输出空串、fact_check 输出 {"supported": 0, "total": 0}
+- fact_check（事实核对）：total = 回答中可核对的事实点数量（上限 10）；supported = 其中能在 rag_context 引用片段原文中逐条找到依据的数量。必须逐条对照引用片段核对后再填数，不要凭感觉
+- rag_context 有明确答案且回答完全基于它 → source_coverage="高"、fact_check 的 supported=total、hallucination_risk="低"
+- rag_context 有部分答案，回答结合了通用运维经验 → source_coverage="中"、supported 部分支撑、hallucination_risk="中"
+- rag_context 无命中，回答主要靠模型推测 → source_coverage="低"、supported 尽量低、hallucination_risk="高" """
 
 # ======================================================================
 # 挂起续推状态说明

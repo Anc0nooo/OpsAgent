@@ -114,13 +114,18 @@ function levelTone(level: string | undefined, goodIsHigh: boolean): string {
   if (level === bad) return 'bad'
   return ''
 }
-/** 准确度百分比配色：≥90 绿，70~89 橙，<70 红 */
-function accuracyTone(acc: string | undefined): string {
-  const n = parseInt((acc || '').replace(/[^\d]/g, ''), 10)
-  if (isNaN(n)) return ''
-  if (n >= 90) return 'good'
-  if (n >= 70) return 'warn'
-  return 'bad'
+/** 准确度配色（口径统一后为 高/中/低；老数据可能是 "95%" 这类百分比，一律显示 — 不再沿用） */
+function accuracyText(acc: string | undefined): string {
+  return ['高', '中', '低'].includes(acc || '') ? (acc as string) : '—'
+}
+/** 命中度配色：新口径 "M/N 段"（按比率 ≥0.7/≥0.45 分色，与可信度阈值一致）；老口径 高/中/低 直接分色 */
+function coverageTone(cov: string | undefined): string {
+  const m = /^(\d+)\s*\/\s*(\d+)/.exec(cov || '')
+  if (m) {
+    const ratio = Number(m[1]) / Number(m[2])
+    return ratio >= 0.7 ? 'good' : ratio >= 0.45 ? 'warn' : 'bad'
+  }
+  return levelTone(cov, true)
 }
 
 /** 自动滚动到最新消息 */
@@ -529,14 +534,14 @@ watch(() => messages.value.length, scrollToBottom)
                   </div>
                   <div class="eval-metric">
                     <span class="eval-label">知识库命中度</span>
-                    <span class="eval-value" :class="levelTone(m.evaluation?.source_coverage, true)">
+                    <span class="eval-value" :class="coverageTone(m.evaluation?.source_coverage)">
                       {{ m.evaluation?.source_coverage || '—' }}
                     </span>
                   </div>
                   <div class="eval-metric">
                     <span class="eval-label">回答准确度</span>
-                    <span class="eval-value" :class="accuracyTone(m.evaluation?.accuracy || '')">
-                      {{ m.evaluation?.accuracy || '—' }}
+                    <span class="eval-value" :class="levelTone(accuracyText(m.evaluation?.accuracy), true)">
+                      {{ accuracyText(m.evaluation?.accuracy) }}
                     </span>
                   </div>
                   <div class="eval-metric">

@@ -114,6 +114,11 @@ def _build_rag_text(segments: list[dict], schema_hits: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# 命中度（source_coverage）客观口径阈值：注入片段中相似度 ≥0.5 计为"相关命中"，
+# 命中度 = 相关命中片段数 / 注入片段总数（如 "3/5 段"）；0.5 与幻觉风险联动下限一致
+HIT_RELEVANT_THRESHOLD = 0.5
+
+
 def _filter_relevant(hits: list[dict]) -> list[dict]:
     """来源相关度过滤：命中分低于阈值的片段不进来源列表/图片回显。
 
@@ -157,7 +162,8 @@ def _collect_sources(segments: list[dict], schema_hits: list[dict],
         for p in pages:
             if p not in g["pages"]:
                 g["pages"].append(p)
-        for im in h.get("images") or []:
+        # 图片回显过滤：装饰图/Logo/空白图（无有效 OCR 文字且面积小）不进来源列表
+        for im in knowledge_service.filter_displayable_images(h.get("images")):
             if not any(x.get("id") == im.get("id") for x in g["images"]):
                 g["images"].append(im)
     for g in grouped.values():
@@ -178,8 +184,12 @@ def build_rag_context(db: Session, user_id: int, query: str) -> str:
     return _build_rag_text(segments, schema_hits)
 
 
-def build_rag_context_detailed(db: Session, user_id: int, query: str) -> tuple[str, list[dict]]:
-    """同 build_rag_context，额外返回命中来源（相关度过滤 + topN + 相似度降序，供引用标注与文档链接）"""
+def build_rag_context_detailed(db: Session, user_id: int, query: str) -> tuple[str, list[dict], dict]:
+    """同 build_rag_context，额外返回命中来源与命中度统计：
+    - sources：相关度过滤 + topN + 相似度降序（供引用标注与文档链接）
+    - seg_stats：{"total": 注入片段总数, "relevant": 相似度≥HIT_RELEVANT_THRESHOLD 的片段数}
+      客观口径，供命中度展示（"3/5 段"），不由模型自报
+    """
     segments, schema_hits = _retrieve_context(db, user_id, query)
     text = _build_rag_text(segments, schema_hits)
     # 来源列表只收相关片段（阈值过滤），图片跟随相关 chunk（未命中引用片段的图片不回显）
@@ -187,4 +197,16 @@ def build_rag_context_detailed(db: Session, user_id: int, query: str) -> tuple[s
         _filter_relevant(segments), _filter_relevant(schema_hits),
         max_docs=settings.SOURCE_MAX_DOCS,
     )
-    return text, sources
+
+    def _score(h: dict) -> float:
+        try:
+            return float(h.get("score") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    all_hits = [*segments, *schema_hits]
+    seg_stats = {
+        "total": len(all_hits),
+        "relevant": sum(1 for h in all_hits if _score(h) >= HIT_RELEVANT_THRESHOLD),
+    }
+    return text, sources, seg_stats
