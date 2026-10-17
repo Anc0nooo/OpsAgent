@@ -7,6 +7,13 @@ RAG 知识库 - 结构化文档加载器
 - 扫描件 PDF（整页无文本层）整页渲染为图片走 OCR
 - 页眉/页脚提取（PDF 取上下固定边距区域文字；Word 取 section.header/footer）
 
+性能设计（大文件友好）：
+- PDF 逐页流式解析，页 dict（get_text("dict")）每页只解析一次并缓存（标题字号与
+  页内块判定复用），避免对每个文字块重复解析整页导致 O(块数²) 卡顿；
+- OCR 延迟并发：解析时仅收集 OCR 任务（图片已落盘，不驻留内存），全文收集完后
+  用线程池按 OCR_CONCURRENCY 并发识别，耗时随并发数而非图片数线性放大；
+- progress_fn(page_done, page_total) 逐页回调，供前端解析阶段进度展示。
+
 加载器不依赖数据库：图片先落盘到 images/user_{uid}/doc_{did}/，返回 image_files 清单，
 由服务层写 kb_images 表拿到 image_id，再回填到 chunk 元数据。
 """
@@ -14,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -22,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 # OCR 回调：(图片字节, mime) -> 识别文字（无文字返回 ""）；加载器不关心用哪个模型
 OcrFn = Callable[[bytes, str], str]
+# 解析进度回调：(已完成页/条数, 总数) -> None
+ProgressFn = Callable[[int, int], None] | None
 
 
 # ----------------------------------------------------------------------
@@ -203,10 +213,93 @@ def _table_to_markdown(rows: list[list[str]]) -> str:
 
 
 # ======================================================================
+# OCR 并发执行（延迟式：解析时只收集任务，全文收集完统一并发识别）
+# ======================================================================
+def _collect_ocr_job(jobs: list[dict], **kw) -> None:
+    """登记一个 OCR 任务：
+    - kind=page:     扫描件整页（渲染图已落盘，path 指向渲染 PNG）
+    - kind=standalone: 独立图片（OCR 出文字会拆成独立 OCR 块，否则留在宿主块）
+    - kind=inline:   文字段落内的图片（OCR 文字只回填 ImageFile，不动块结构）
+    insert_pos 记录收集时的 blocks 长度，回填时按位置倒序插入保持页序。
+    """
+    jobs.append(kw)
+
+
+def _apply_ocr_result(blocks: list, job: dict, text: str) -> None:
+    """把单个 OCR 结果回填到块结构（按 insert_pos 倒序应用，保持原有页序）"""
+    if job["kind"] == "page":
+        if text:
+            blocks.insert(job["insert_pos"], Block(
+                kind="ocr", text=f"[图片OCR-第{job['page_no']}页扫描件]\n{text}",
+                page=job["page_no"],
+            ))
+        return
+    imf: ImageFile = job["image_file"]
+    imf.ocr_text = text
+    ref = job.get("img_ref")
+    if ref is not None:
+        ref["ocr_text"] = text
+    if job["kind"] == "inline" or not text:
+        return  # 段内图片只回填元数据；无文字的独立图保持挂载在宿主块
+    # standalone + 有文字：从宿主块摘下引用，在原位置插入独立 OCR 块
+    host = job.get("host")
+    if host is not None and ref is not None and ref in host.images:
+        host.images.remove(ref)
+    blocks.insert(job["insert_pos"], Block(
+        kind="ocr", text=f"[图片OCR]\n{text}", page=job["page_no"],
+        images=[ref] if ref is not None else [],
+        header=job.get("header", ""), footer=job.get("footer", ""),
+    ))
+
+
+def _run_ocr_jobs(jobs: list[dict], ocr_fn: OcrFn | None,
+                  blocks: list, progress_fn: ProgressFn = None,
+                  progress_base: int = 0, progress_total: int = 0) -> int:
+    """
+    并发执行收集好的 OCR 任务（ThreadPoolExecutor，OCR_CONCURRENCY 限流防 429）。
+    全部完成后按 insert_pos 倒序回填块结构。返回成功产出文字的任务数。
+    """
+    if not jobs or ocr_fn is None:
+        return 0
+    from app.config.settings import settings
+
+    def work(job: dict) -> str:
+        try:
+            img_bytes = Path(job["path"]).read_bytes()
+            return _safe_ocr(ocr_fn, img_bytes, job["mime"])
+        except OSError as e:
+            logger.warning("OCR 图片读取失败 %s: %s", job["path"], e)
+            return ""
+
+    ok = 0
+    results: list[tuple[dict, str]] = []
+    with ThreadPoolExecutor(max_workers=min(settings.OCR_CONCURRENCY, len(jobs))) as ex:
+        futs = {ex.submit(work, j): j for j in jobs}
+        for i, fut in enumerate(as_completed(futs)):
+            job = futs[fut]
+            try:
+                text = fut.result() or ""
+            except Exception as e:  # noqa: BLE001
+                logger.warning("OCR 任务执行失败（跳过该图）: %s", e)
+                text = ""
+            if text:
+                ok += 1
+            results.append((job, text))
+            # OCR 阶段进度（基于收集顺序的页码区间上报）
+            if progress_fn and progress_total:
+                progress_fn(progress_base + i + 1, progress_total)
+
+    # 按 insert_pos 倒序回填：靠前的插入不影响靠后任务记录的位置索引
+    for job, text in sorted(results, key=lambda x: x[0]["insert_pos"], reverse=True):
+        _apply_ocr_result(blocks, job, text)
+    return ok
+
+
+# ======================================================================
 # PDF
 # ======================================================================
 def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
-                 ocr_fn: OcrFn | None) -> ParsedDocument:
+                 ocr_fn: OcrFn | None, progress_fn: ProgressFn = None) -> ParsedDocument:
     import pymupdf
 
     from app.config.settings import settings
@@ -214,28 +307,40 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
     img_dir.mkdir(parents=True, exist_ok=True)
     blocks: list[Block] = []
     image_files: list[ImageFile] = []
-    ocr_count = 0
+    ocr_jobs: list[dict] = []   # 延迟 OCR 任务（页循环内只收集，最后并发执行）
+    ocr_quota = settings.OCR_MAX_IMAGES_PER_DOC  # 剩余 OCR 名额（控成本/控时长）
 
     with pymupdf.open(stream=data, filetype="pdf") as pdf:
-        for pno in range(pdf.page_count):
+        total_pages = pdf.page_count
+        for pno in range(total_pages):
             page = pdf[pno]
             page_no = pno + 1
             ph = page.rect.height
             header_text, footer_text = "", ""
 
-            # ---- 扫描件：整页几乎无文本层 → 渲染整页走 OCR ----
+            # ---- 页 dict 只解析一次并缓存（字号统计与块级判定复用，消除 O(n²)）----
+            try:
+                page_dict = page.get_text("dict")
+            except Exception:  # noqa: BLE001
+                page_dict = {}
+
+            # ---- 扫描件：整页几乎无文本层 → 渲染整页落盘，稍后并发 OCR ----
             plain_text = page.get_text().strip()
             if len(plain_text) < settings.SCANNED_PAGE_MIN_CHARS:
-                if ocr_fn is not None:
-                    pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
-                    img_bytes = pix.tobytes("png")
-                    ocr_text = _safe_ocr(ocr_fn, img_bytes, "image/png")
-                    if ocr_text:
-                        blocks.append(Block(
-                            kind="ocr", text=f"[图片OCR-第{page_no}页扫描件]\n{ocr_text}",
-                            page=page_no,
-                        ))
-                        ocr_count += 1
+                if ocr_fn is not None and ocr_quota > 0:
+                    try:
+                        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2))
+                        key = f"p{page_no}_scan"
+                        scan_path = img_dir / f"{key}.png"
+                        scan_path.write_bytes(pix.tobytes("png"))
+                        ocr_quota -= 1
+                        _collect_ocr_job(
+                            ocr_jobs, kind="page", page_no=page_no,
+                            path=str(scan_path), mime="image/png",
+                            insert_pos=len(blocks),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("扫描页渲染失败 page=%s: %s", page_no, e)
                 continue
 
             # ---- 表格区域（find_tables），命中区域内的文字块跳过，避免与表格文本重复 ----
@@ -252,13 +357,10 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 return any(rx0 <= cx <= rx1 and ry0 <= cy <= ry1
                            for rx0, ry0, rx1, ry1 in table_rects)
 
-            # ---- 文字块（dict 模式：取字号识别标题；blocks 模式位置更稳，用 blocks）----
-            raw_blocks = page.get_text("blocks") or []
-            # 字号（用于标题启发式）：dict blocks 取每块最大字号
+            # ---- 字号统计（复用缓存 page_dict）----
             sizes = []
             try:
-                d = page.get_text("dict")
-                for db_ in d.get("blocks", []):
+                for db_ in page_dict.get("blocks", []):
                     for ln in db_.get("lines", []):
                         for sp in ln.get("spans", []):
                             if sp.get("text", "").strip():
@@ -270,7 +372,7 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
 
             # ---- 文字块收集（含 bbox 与标题判定；供同段落碎片合并）----
             items: list[list] = []  # [x0, y0, x1, y1, text, kind]
-            for item in raw_blocks:
+            for item in page.get_text("blocks") or []:
                 x0, y0, x1, y1, txt = item[0], item[1], item[2], item[3], item[4]
                 btype = item[6] if len(item) > 6 else 0
                 body = _join_phys_lines(txt)  # 块内物理换行 → 完整段落
@@ -285,7 +387,7 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 if y0 >= ph * 0.92:
                     footer_text = (footer_text + " " + body).strip()
                     continue
-                kind = "heading" if len(body) <= 40 and _block_max_size(page, x0, y0, x1, y1) >= big_size else "paragraph"
+                kind = "heading" if len(body) <= 40 and _block_max_size(page_dict, x0, y0, x1, y1) >= big_size else "paragraph"
                 items.append([x0, y0, x1, y1, body, kind])
 
             # ---- 同段落碎片合并：不少 PDF 把一行/一个字体片段拆成独立 block ----
@@ -314,15 +416,13 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                         blocks.append(Block(kind="table", text=md, page=page_no,
                                             header=header_text, footer=footer_text))
 
-            # ---- 内嵌图片：提取落盘 + OCR（按 xref 去重，跳过图标）----
+            # ---- 内嵌图片：提取落盘（OCR 延迟并发；按 xref 去重，跳过图标）----
             seen_xref: set[int] = set()
             for info in page.get_images(full=True):
                 xref = info[0]
                 if xref in seen_xref:
                     continue
                 seen_xref.add(xref)
-                if ocr_count >= settings.OCR_MAX_IMAGES_PER_DOC:
-                    ocr_fn = None  # 达上限：后续只存图不 OCR
                 try:
                     extracted = pdf.extract_image(xref)
                     img_bytes = extracted["image"]
@@ -340,30 +440,43 @@ def _extract_pdf(data: bytes, img_dir: Path, rel_dir: str,
                 key = f"p{page_no}_x{xref}"
                 rel_path = f"{rel_dir}/{key}.{ext}"
                 (img_dir / f"{key}.{ext}").write_bytes(img_bytes)
-                ocr_text = _safe_ocr(ocr_fn, img_bytes, f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}") if ocr_fn else ""
-                if ocr_text:
-                    ocr_count += 1
-                image_files.append(ImageFile(key, rel_path, page_no, bbox, ocr_text,
-                                             f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"))
-                img_ref = {"key": key, "page": page_no, "bbox": bbox, "ocr_text": ocr_text}
-                # OCR 文字作为独立块（与原图绑定）；无 OCR 文字则把图片挂到同页最后一个正文块
-                if ocr_text:
-                    blocks.append(Block(kind="ocr", text=f"[图片OCR]\n{ocr_text}", page=page_no,
-                                        images=[img_ref], header=header_text, footer=footer_text))
-                elif blocks and blocks[-1].page == page_no:
-                    blocks[-1].images.append(img_ref)
+                mime = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+                imf = ImageFile(key, rel_path, page_no, bbox, "", mime)
+                image_files.append(imf)
+                img_ref = {"key": key, "page": page_no, "bbox": bbox, "ocr_text": ""}
+                host = blocks[-1] if blocks and blocks[-1].page == page_no else None
+                if ocr_fn is not None and ocr_quota > 0:
+                    # OCR 延迟执行：出文字拆独立 OCR 块（插回本页末尾），否则留在宿主块
+                    ocr_quota -= 1
+                    if host is not None:
+                        host.images.append(img_ref)
+                    _collect_ocr_job(
+                        ocr_jobs, kind="standalone", page_no=page_no,
+                        path=str(img_dir / f"{key}.{ext}"), mime=mime,
+                        image_file=imf, img_ref=img_ref, host=host,
+                        header=header_text, footer=footer_text,
+                        insert_pos=len(blocks),
+                    )
+                elif host is not None:
+                    host.images.append(img_ref)
+
+            if progress_fn:
+                progress_fn(page_no, total_pages)
+
+    # ---- 统一并发 OCR（图片已落盘，任务只持有路径，不驻留内存）----
+    _run_ocr_jobs(ocr_jobs, ocr_fn, blocks, progress_fn=progress_fn,
+                  progress_base=total_pages, progress_total=total_pages + len(ocr_jobs))
 
     # 跨页段落续行合并（段落被分页打断的场景）
     return ParsedDocument(kind="pdf", blocks=_merge_cross_page_paragraphs(blocks),
                           image_files=image_files)
 
 
-def _block_max_size(page, x0: float, y0: float, x1: float, y1: float) -> float:
-    """取与给定 bbox 相交的 span 最大字号（标题启发式；失败返回 0）"""
+def _block_max_size(page_dict: dict, x0: float, y0: float, x1: float, y1: float) -> float:
+    """取与给定 bbox 相交的 span 最大字号（标题启发式；复用缓存的页 dict，失败返回 0）"""
     try:
-        d = page.get_text("dict")
         best = 0.0
-        for db_ in d.get("blocks", []):
+        for db_ in page_dict.get("blocks", []):
             for ln in db_.get("lines", []):
                 lbb = ln.get("bbox")
                 if lbb and (lbb[2] < x0 - 2 or lbb[0] > x1 + 2 or lbb[3] < y0 - 2 or lbb[1] > y1 + 2):
@@ -391,7 +504,7 @@ def _safe_ocr(ocr_fn: OcrFn | None, img_bytes: bytes, mime: str) -> str:
 # DOCX
 # ======================================================================
 def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
-                  ocr_fn: OcrFn | None) -> ParsedDocument:
+                  ocr_fn: OcrFn | None, progress_fn: ProgressFn = None) -> ParsedDocument:
     import io
 
     from docx import Document as _Docx
@@ -403,6 +516,8 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
     img_dir.mkdir(parents=True, exist_ok=True)
     blocks: list[Block] = []
     image_files: list[ImageFile] = []
+    ocr_jobs: list[dict] = []
+    ocr_quota = settings.OCR_MAX_IMAGES_PER_DOC
 
     # 页眉页脚（Word 按 section；首页/奇偶页简化取第一节可用文本）
     header_text = footer_text = ""
@@ -414,6 +529,7 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
         pass
 
     def paragraph_images(p: _Paragraph) -> list[dict]:
+        """提取段内图片：落盘 + 登记 ImageFile，OCR 延迟并发（inline 任务只回填元数据）"""
         refs: list[dict] = []
         try:
             blips = p._p.findall(".//" + qn("a:blip"))
@@ -432,13 +548,24 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
             key = f"img_{len(image_files) + 1}"
             rel_path = f"{rel_dir}/{key}.{ext}"
             (img_dir / f"{key}.{ext}").write_bytes(blob)
-            ocr_text = _safe_ocr(ocr_fn, blob, ctype) if ocr_fn else ""
-            image_files.append(ImageFile(key, rel_path, None, "", ocr_text, ctype))
-            refs.append({"key": key, "page": None, "bbox": "", "ocr_text": ocr_text})
+            imf = ImageFile(key, rel_path, None, "", "", ctype)
+            image_files.append(imf)
+            ref = {"key": key, "page": None, "bbox": "", "ocr_text": ""}
+            if ocr_fn is not None and ocr_quota > 0:
+                ocr_quota -= 1
+                _collect_ocr_job(
+                    ocr_jobs, kind="inline", page_no=None,
+                    path=str(img_dir / f"{key}.{ext}"), mime=ctype,
+                    image_file=imf, img_ref=ref, host=None,
+                    header=header_text, footer=footer_text,
+                    insert_pos=len(blocks),
+                )
+            refs.append(ref)
         return refs
 
     body = doc.element.body
-    for child in body.iterchildren():
+    children = list(body.iterchildren())
+    for idx, child in enumerate(children):
         if child.tag == qn("w:p"):
             p = _Paragraph(child, doc)
             imgs = paragraph_images(p)
@@ -451,18 +578,32 @@ def _extract_docx(data: bytes, img_dir: Path, rel_dir: str,
                     text = _join_phys_lines(text)
                 blocks.append(Block(kind=kind, text=text, header=header_text, footer=footer_text, images=imgs))
             elif imgs:
-                # 纯图片段落：有 OCR 文字则成块，否则挂到上一块
+                # 纯图片段落：OCR 出文字则成独立块（延迟回填），否则挂到上一块
                 for ref in imgs:
-                    if ref["ocr_text"]:
-                        blocks.append(Block(kind="ocr", text=f"[图片OCR]\n{ref['ocr_text']}",
-                                            images=[ref], header=header_text, footer=footer_text))
-                    elif blocks:
-                        blocks[-1].images.append(ref)
+                    host = blocks[-1] if blocks else None
+                    if host is not None:
+                        host.images.append(ref)
+                    imf = next((x for x in image_files if x.key == ref["key"]), None)
+                    if ocr_fn is not None and ocr_quota > 0 and imf is not None:
+                        ext = "jpeg" if "jpeg" in (imf.content_type or "") else "png"
+                        ocr_quota -= 1
+                        _collect_ocr_job(
+                            ocr_jobs, kind="standalone", page_no=None,
+                            path=str(img_dir / f"{ref['key']}.{ext}"), mime=imf.content_type or "image/png",
+                            image_file=imf, img_ref=ref, host=host,
+                            header=header_text, footer=footer_text,
+                            insert_pos=len(blocks),
+                        )
         elif child.tag == qn("w:tbl"):
             t = _Table(child, doc)
             md = _table_to_markdown([[c.text for c in row.cells] for row in t.rows])
             if md:
                 blocks.append(Block(kind="table", text=md, header=header_text, footer=footer_text))
+        if progress_fn:
+            progress_fn(idx + 1, len(children))
+
+    # ---- 统一并发 OCR ----
+    _run_ocr_jobs(ocr_jobs, ocr_fn, blocks)
 
     return ParsedDocument(kind="docx", blocks=blocks, image_files=image_files)
 
@@ -500,8 +641,9 @@ def _extract_text(data: bytes, filename: str) -> ParsedDocument:
 # 统一入口
 # ======================================================================
 def parse_file(data: bytes, filename: str, user_id: int, doc_id: int,
-               ocr_fn: OcrFn | None = None) -> ParsedDocument:
-    """按扩展名解析上传文件。rel_dir 为相对 DATA_DIR 的图片目录。"""
+               ocr_fn: OcrFn | None = None, progress_fn: ProgressFn = None) -> ParsedDocument:
+    """按扩展名解析上传文件。rel_dir 为相对 DATA_DIR 的图片目录。
+    progress_fn(done, total)：PDF 按页、Word 按元素推进，供解析阶段进度展示。"""
     from app.config.settings import settings
 
     lower = filename.lower()
@@ -509,9 +651,11 @@ def parse_file(data: bytes, filename: str, user_id: int, doc_id: int,
     img_dir = settings.IMAGES_DIR / f"user_{user_id}" / f"doc_{doc_id}"
 
     if lower.endswith(".pdf"):
-        return _extract_pdf(data, img_dir, rel_dir, ocr_fn)
+        return _extract_pdf(data, img_dir, rel_dir, ocr_fn, progress_fn=progress_fn)
     if lower.endswith(".docx"):
-        return _extract_docx(data, img_dir, rel_dir, ocr_fn)
+        return _extract_docx(data, img_dir, rel_dir, ocr_fn, progress_fn=progress_fn)
     if lower.endswith((".txt", ".md", ".markdown", ".sql")):
+        if progress_fn:
+            progress_fn(1, 1)
         return _extract_text(data, filename)
     raise ValueError(f"不支持的文件类型: {filename}（支持 txt/md/sql/pdf/docx）")

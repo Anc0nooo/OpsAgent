@@ -58,9 +58,10 @@ async function removeDoc(d: DocInfo) {
   }
 }
 
-// ---------------- 入库/重建进度 ----------------
+// ---------------- 入库/重建进度（后端任务异步执行，前端轮询） ----------------
 const kbProgress = ref<KbProgress>({ status: 'idle' })
 let _progressTimer: ReturnType<typeof setInterval> | null = null
+let _taskResolve: ((p: KbProgress) => void) | null = null
 const _maxPct = ref(0)   // 单调夹紧：进度只增不减，不回跳
 
 function startProgressPoll() {
@@ -70,8 +71,11 @@ function startProgressPoll() {
     try {
       kbProgress.value = await getProgress()
       if (pctRaw.value > _maxPct.value) _maxPct.value = pctRaw.value
-      if (kbProgress.value.status === 'done' || kbProgress.value.status === 'error') {
-        stopProgressPoll()
+      const st = kbProgress.value.status
+      if ((st === 'done' || st === 'error') && _taskResolve) {
+        const r = _taskResolve
+        _taskResolve = null
+        r(kbProgress.value)
       }
     } catch { /* 忽略轮询错误 */ }
   }, 1500)
@@ -79,13 +83,30 @@ function startProgressPoll() {
 function stopProgressPoll() {
   if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null }
 }
+
+/** 等待当前后台任务结束（复用进度轮询；提交前先本地重置状态防上一轮结果误判） */
+function waitTaskDone(): Promise<KbProgress> {
+  return new Promise((resolve) => {
+    const st = kbProgress.value.status
+    if (st === 'done' || st === 'error') { resolve(kbProgress.value); return }
+    _taskResolve = resolve
+  })
+}
+
+// 多文件上传：进度 = 已完成文件占比 + 当前文件阶段进度（全程单调，不回跳）
+const uploadFileTotal = ref(0)
+const uploadFileDone = ref(0)
 // 阶段化百分比：解析/分块 0-40%，向量化 40-100%（阶段间天然单调，再叠加历史最大值夹紧）
 const pctRaw = computed(() => {
   const p = kbProgress.value
   if (p.status === 'done') return 100
   const frac = (p.total ?? 0) > 0 ? Math.min(1, (p.done ?? 0) / (p.total ?? 1)) : 0
-  if (p.phase === 'embedding') return Math.round(40 + frac * 60)
-  return Math.round(frac * 40)
+  const fileFrac = p.phase === 'embedding' ? 0.4 + frac * 0.6 : frac * 0.4
+  if (uploadFileTotal.value > 1) {
+    const base = uploadFileDone.value / uploadFileTotal.value
+    return Math.round((base + fileFrac / uploadFileTotal.value) * 100)
+  }
+  return Math.round(fileFrac * 100)
 })
 const progressPct = computed(() => Math.max(pctRaw.value, _maxPct.value))
 
@@ -97,14 +118,21 @@ async function rebuildIndex() {
     '将按当前分块策略（更大块 + 重叠）对全部文档重新切分并重新向量化。文档内容保留不丢失，过程可能耗时较长，确认重建？',
   ))) return
   reindexing.value = true
-  kbProgress.value = { status: 'processing', detail: '重建索引中…' }
+  kbProgress.value = { status: 'processing', detail: '提交重建任务…' }
   startProgressPoll()
   try {
-    const r = await reindex()
-    toast(`重建完成：${r.docs} 篇文档，${r.chunks} 个块`)
+    await reindex()
+    const p = await waitTaskDone()
+    if (p.status === 'error') {
+      toast(p.error || p.detail || '重建索引失败', true)
+    } else {
+      const r = p.result
+      toast(`重建完成：${r?.docs ?? 0} 篇文档，${r?.chunks ?? 0} 个块`)
+    }
     await refreshDocs()
   } catch (e) {
     toast(e instanceof Error ? e.message : '重建索引失败', true)
+    await refreshDocs()
   } finally {
     stopProgressPoll()
     reindexing.value = false
@@ -172,21 +200,33 @@ async function onFilePicked(ev: Event) {
   const files = (ev.target as HTMLInputElement).files
   if (!files || !files.length) return
   uploading.value = true
-  kbProgress.value = { status: 'processing', detail: '解析文档中…' }
+  uploadFileTotal.value = files.length
+  uploadFileDone.value = 0
   startProgressPoll()
   try {
     for (const f of Array.from(files)) {
-      _maxPct.value = 0   // 每个文件重新计进度
+      // 本地重置进度状态，防止上一轮任务的 done/error 误判为当前文件
+      kbProgress.value = { status: 'processing', phase: 'queued', detail: '提交上传任务…' }
       await uploadDoc(f, uploadType.value, uploadTitle.value || undefined)
-      toast(`「${f.name}」入库成功`)
+      // 实际入库在后台任务执行，轮询等待结束（大文件不再受 HTTP 超时限制）
+      const p = await waitTaskDone()
+      uploadFileDone.value++
+      if (p.status === 'error') {
+        throw new Error(`「${f.name}」${p.error || p.detail || '入库失败'}`)
+      }
+      const failed = p.result?.failed_chunks ?? 0
+      toast(`「${f.name}」入库成功${failed ? `（${failed} 个块向量化失败，可重建索引补齐）` : ''}`)
     }
     uploadTitle.value = ''
     await refreshDocs()
   } catch (e) {
     toast(e instanceof Error ? e.message : '上传失败', true)
+    await refreshDocs()
   } finally {
     stopProgressPoll()
     uploading.value = false
+    uploadFileTotal.value = 0
+    uploadFileDone.value = 0
     if (fileInput.value) fileInput.value.value = ''
   }
 }

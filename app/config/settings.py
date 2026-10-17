@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     BM25_WEIGHT: float = 0.5                 # BM25 融合权重
     VECTOR_WEIGHT: float = 0.5               # 向量融合权重
     EMBED_BATCH_SIZE: int = 16               # 向量化单批上限（百炼 text-embedding-v3 单批 25 条，16 留余量）
+    EMBED_CONCURRENCY: int = 4               # 向量化并发批数（大批量 chunk 时多批并发调用，防串行耗时线性放大）
+    MAX_EMBED_CHARS: int = 6000              # 单块字符硬上限（text-embedding-v3 单条 8192 token，超限强制按语义边界二次切分）
+    OCR_CONCURRENCY: int = 3                 # OCR（qwen-vl）并发数，防 429 限流
+
+    # ---- 引用来源过滤（回答下方只展示真正相关的来源文档与图片）----
+    SOURCE_SIM_THRESHOLD: float = 0.35       # 来源相关度阈值：命中分低于该值的片段不进来源列表/图片回显
+    SOURCE_MAX_DOCS: int = 5                 # 来源文档数上限（按相似度降序截断）
 
     # ---- 会话与查询约束 ----
     # 上下文保留最近"轮数"（1 轮 = 1 user + 1 assistant = 2 条消息）；

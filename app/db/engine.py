@@ -80,6 +80,14 @@ def _migrate_schema() -> None:
                     conn.execute(text(f"ALTER TABLE knowledge_chunks ADD COLUMN {name} {ddl}"))
                     logger.info("knowledge_chunks 表已补充 %s 列", name)
 
+    # messages 补 meta 列（回答元信息 JSON：sources/evaluation/confidence，历史恢复用）
+    if "messages" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("messages")}
+        if "meta" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE messages ADD COLUMN meta TEXT NULL"))
+            logger.info("messages 表已补充 meta 列")
+
     # 迁移后：如果没有 ancon 角色，把第一个用户（最小 ID）设为 ancon
     with engine.begin() as conn:
         result = conn.execute(text("SELECT COUNT(*) FROM users WHERE role = 'ancon'")).scalar()

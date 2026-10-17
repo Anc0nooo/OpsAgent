@@ -16,9 +16,12 @@ RAG 知识库 - 语义分块器（对应 FR-RAG-02，支持按文档类型差异
 若文档被误标为其他类型但内容明显是表结构（looks_like_table_doc），
 表格块同样按整表保护阈值处理，避免字段被切断。
 """
+import logging
 import re
 
 from app.config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 # markdown 标题行
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -272,7 +275,7 @@ def split_document(text: str, max_chars: int = 600, overlap: int = 150,
                 for p in parts:
                     if p.strip():
                         chunks.append({"text": p.strip(), "section": section})
-    return chunks
+    return cap_chunks(chunks)
 
 
 # ======================================================================
@@ -474,9 +477,80 @@ def split_structured(blocks: list, doc_type: str,
     结构化块 → chunk dict（含 text/section/page/header/footer/images）。
     - schema / medical：模式A 语义切分（忽略 chunk_size/overlap）；
     - guide / bug / other：模式B，chunk_size/overlap 由每用户设置决定。
+    出口统一过 cap_chunks 硬保护（超长块二次切分，防 embedding token 超限）。
     """
     if doc_type == "schema":
-        return _split_schema_semantic(blocks)
+        return cap_chunks(_split_schema_semantic(blocks))
     if doc_type == "medical":
-        return _split_medical_semantic(blocks)
-    return _split_mode_b(blocks, chunk_size, overlap)
+        return cap_chunks(_split_medical_semantic(blocks))
+    return cap_chunks(_split_mode_b(blocks, chunk_size, overlap))
+
+
+# ======================================================================
+# Embedding 硬保护：超长 chunk 二次切分（大文档切块失败的最大根因防护）
+# text-embedding-v3 单条上限 8192 token；超长整块（如几万字大表/整段）
+# 直接 embed 会 API 报错导致整个任务失败，此处强制按语义边界预切。
+# ======================================================================
+def _cap_long_text(text: str, limit: int) -> list[str]:
+    """超长文本二次切分：表格按字段行分批（公共头=前导说明+表头，不拆字段行）；普通文本按语义边界。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    # 定位 Markdown 表格分隔行（不限前 8 行：cap 输入可能带长前导说明）
+    sep_idx = -1
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("|") and "-" in s and _TABLE_SEP_RE.match(s):
+            sep_idx = i
+            break
+    if sep_idx >= 1:
+        header = "\n".join(lines[:sep_idx + 1])
+        data_rows = [ln for ln in lines[sep_idx + 1:] if ln.strip()]
+        if data_rows:
+            chunks: list[str] = []
+            cur: list[str] = []
+            cur_len = len(header)
+            for row in data_rows:
+                if cur and cur_len + len(row) + 1 > limit:
+                    chunks.append(header + "\n" + "\n".join(cur))
+                    cur, cur_len = [row], len(header) + len(row) + 1
+                else:
+                    cur.append(row)
+                    cur_len += len(row) + 1
+            if cur:
+                chunks.append(header + "\n" + "\n".join(cur))
+            return chunks
+    return _recursive_split(text, limit, _SEPARATORS)
+
+
+def cap_chunks(chunks: list[dict], limit: int | None = None) -> list[dict]:
+    """
+    chunk 硬保护（embedding 前最后一道闸）：单块超过 settings.MAX_EMBED_CHARS 时
+    强制按语义边界二次切分，保证 embedding 不因 token 超限失败。
+    - 表格按字段行分批，每批重复公共头（前导说明+表头），字段行绝不从中间断开；
+    - 位置元数据（page/header/footer）沿用原块；图片只随首片，避免跨片重复回显；
+    - 超长块记录 warning 日志；仍超长的极端片段（无分隔符连续串）按字符硬切兜底。
+    """
+    limit = int(limit or settings.MAX_EMBED_CHARS)
+    out: list[dict] = []
+    for c in chunks:
+        text = c.get("text") or ""
+        if len(text) <= limit:
+            out.append(c)
+            continue
+        logger.warning("chunk 超长（%d 字 > %d 上限），按语义边界二次切分 section=%s",
+                       len(text), limit, c.get("section", ""))
+        final: list[str] = []
+        for p in _cap_long_text(text, limit):
+            if len(p) <= limit:
+                final.append(p)
+            else:
+                final.extend(p[i:i + limit] for i in range(0, len(p), limit) if p[i:i + limit].strip())
+        for i, p in enumerate(final):
+            body = p.strip()
+            if not body:
+                continue
+            nc = dict(c)
+            nc["text"] = body
+            if i > 0:
+                nc["images"] = []
+            out.append(nc)
+    return out

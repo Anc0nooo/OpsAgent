@@ -73,14 +73,20 @@ export async function listDocs(): Promise<DocInfo[]> {
   return unwrap<DocInfo[]>(r.data, '获取文档列表失败')
 }
 
-/** 上传文档（txt/md/sql/pdf/docx） */
-export async function uploadDoc(file: File, docType: string, title?: string): Promise<{ doc_id: number }> {
+/** 上传结果（提交后立即返回，实际入库在后台任务执行，进度走 getProgress 轮询） */
+export interface UploadAccepted {
+  task: 'accepted'
+  message: string
+}
+
+/** 上传文档（txt/md/sql/pdf/docx）；提交后后台处理，前端轮询进度 */
+export async function uploadDoc(file: File, docType: string, title?: string): Promise<UploadAccepted> {
   const form = new FormData()
   form.append('file', file)
   form.append('doc_type', docType)
   if (title) form.append('title', title)
   const r = await http.post('/upload', form)
-  return unwrap<{ doc_id: number }>(r.data, '上传失败')
+  return unwrap<UploadAccepted>(r.data, '上传失败')
 }
 
 /** 粘贴文本入库 */
@@ -128,10 +134,10 @@ export async function searchDocs(query: string, docType?: string, topK = 5): Pro
   return unwrap<SearchHit[]>(r.data, '检索失败')
 }
 
-/** 重建索引：按当前分块策略（更大块 + 重叠）重新切分并重新向量化全部文档；文档保留，耗时较长 */
-export async function reindex(): Promise<{ docs: number; chunks: number }> {
-  const r = await http.post('/reindex', {}, { timeout: 600000 })
-  return unwrap<{ docs: number; chunks: number }>(r.data, '重建索引失败')
+/** 重建索引：提交后台任务（重新切分并重新向量化全部文档）；进度与结果走 getProgress 轮询 */
+export async function reindex(): Promise<{ task: 'accepted'; message: string }> {
+  const r = await http.post('/reindex', {})
+  return unwrap<{ task: 'accepted'; message: string }>(r.data, '重建索引失败')
 }
 
 /** 读取当前用户切分参数（未设置过返回默认 500/50） */
@@ -140,13 +146,26 @@ export async function getKbSettings(): Promise<KbSettings> {
   return unwrap<KbSettings>(r.data, '获取切分参数失败')
 }
 
-/** 入库/重建进度（前端轮询展示进度条） */
+/** 入库/重建进度（前端轮询展示进度条；后端任务异步执行，进度单调递增） */
+export interface KbProgressResult {
+  doc_id?: number
+  chunks?: number
+  failed_chunks?: number
+  failed_sample?: string[]
+  docs?: number
+  message?: string
+}
+
 export interface KbProgress {
   status: 'idle' | 'processing' | 'done' | 'error'
-  phase?: 'parsing' | 'splitting' | 'embedding'
+  phase?: 'queued' | 'parsing' | 'splitting' | 'embedding'
   done?: number
   total?: number
   detail?: string
+  /** 任务成功结束的结果（doc_id/块数/失败块明细等） */
+  result?: KbProgressResult
+  /** 任务失败的分类错误信息（API 限流/超时/token 超限/解析失败等） */
+  error?: string
 }
 
 /** 查询当前用户入库/重建进度 */

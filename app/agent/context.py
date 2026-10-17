@@ -114,8 +114,27 @@ def _build_rag_text(segments: list[dict], schema_hits: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _collect_sources(segments: list[dict], schema_hits: list[dict]) -> list[dict]:
-    """从合并片段与表结构块收集来源文档（按 doc_id 去重保序），并聚合页码与原图"""
+def _filter_relevant(hits: list[dict]) -> list[dict]:
+    """来源相关度过滤：命中分低于阈值的片段不进来源列表/图片回显。
+
+    仅影响 sources 展示；rag_context 注入用全量片段（低分片段仍可补充回答内容）。
+    """
+    th = settings.SOURCE_SIM_THRESHOLD
+    out: list[dict] = []
+    for h in hits:
+        try:
+            score = float(h.get("score") or 0.0)  # 分数缺失按 0 分处理（视为不相关，剔除）
+        except (TypeError, ValueError):
+            score = 0.0
+        if score < th:
+            continue
+        out.append(h)
+    return out
+
+
+def _collect_sources(segments: list[dict], schema_hits: list[dict],
+                     max_docs: int | None = None) -> list[dict]:
+    """收集来源文档：按 doc_id 去重，聚合页码/原图/真实相似度；按相似度降序排列，可截断 topN"""
     grouped: dict[int, dict] = {}
     order: list[int] = []
     for h in [*segments, *schema_hits]:
@@ -125,10 +144,15 @@ def _collect_sources(segments: list[dict], schema_hits: list[dict]) -> list[dict
         if did not in grouped:
             grouped[did] = {
                 "doc_id": did, "doc_title": h.get("doc_title", ""),
-                "pages": [], "images": [],
+                "pages": [], "images": [], "similarity": 0.0,
             }
             order.append(did)
         g = grouped[did]
+        # 相似度取该文档所有命中片段的最高分（混合检索融合分，0~1）
+        try:
+            g["similarity"] = max(g["similarity"], float(h.get("score") or 0.0))
+        except (TypeError, ValueError):
+            pass
         pages = h.get("pages") or ([h.get("page")] if h.get("page") else [])
         for p in pages:
             if p not in g["pages"]:
@@ -138,7 +162,11 @@ def _collect_sources(segments: list[dict], schema_hits: list[dict]) -> list[dict
                 g["images"].append(im)
     for g in grouped.values():
         g["pages"].sort()
-    return [grouped[d] for d in order]
+    out = [grouped[d] for d in order]
+    out.sort(key=lambda s: s["similarity"], reverse=True)  # 按相似度降序（与展示顺序一致）
+    if max_docs and len(out) > max_docs:
+        out = out[:max_docs]
+    return out
 
 
 def build_rag_context(db: Session, user_id: int, query: str) -> str:
@@ -151,8 +179,12 @@ def build_rag_context(db: Session, user_id: int, query: str) -> str:
 
 
 def build_rag_context_detailed(db: Session, user_id: int, query: str) -> tuple[str, list[dict]]:
-    """同 build_rag_context，额外返回命中来源（含 doc_id/doc_title，去重保序，供引用标注与文档链接）"""
+    """同 build_rag_context，额外返回命中来源（相关度过滤 + topN + 相似度降序，供引用标注与文档链接）"""
     segments, schema_hits = _retrieve_context(db, user_id, query)
     text = _build_rag_text(segments, schema_hits)
-    sources = _collect_sources(segments, schema_hits)
+    # 来源列表只收相关片段（阈值过滤），图片跟随相关 chunk（未命中引用片段的图片不回显）
+    sources = _collect_sources(
+        _filter_relevant(segments), _filter_relevant(schema_hits),
+        max_docs=settings.SOURCE_MAX_DOCS,
+    )
     return text, sources

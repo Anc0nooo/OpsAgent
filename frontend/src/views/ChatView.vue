@@ -12,7 +12,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { getHealth, type HealthInfo } from '../api'
 import { getSettingsStatus, type SettingsStatus } from '../api/settings'
-import { exportFile, loadSession, saveSessionKnowledge, streamChat, type AnswerEvaluation, type PendingQuery, type SourceRef, type SummarySections } from '../api/chat'
+import { exportFile, loadSession, saveSessionKnowledge, streamChat, type AnswerEvaluation, type ConfidenceInfo, type PendingQuery, type SourceRef, type SummarySections } from '../api/chat'
 import { kbImageUrl } from '../api/knowledge'
 import DocViewDialog from '../components/DocViewDialog.vue'
 
@@ -30,6 +30,8 @@ interface ChatMessage {
   sources?: SourceRef[]
   /** 回答质量自评卡片（仅工作类问题携带；闲聊无此字段） */
   evaluation?: AnswerEvaluation
+  /** 真实可信度（检索最高相似度分数 + 分层；仅工作类问题携带） */
+  confidence?: ConfidenceInfo
   /** 后端分类错误码（error 事件携带） */
   error_code?: string
   /** 方案摘要面板是否展开（默认 false，点按钮才展开） */
@@ -185,8 +187,9 @@ async function handleSend() {
       aiMsg.sections = done.sections
     }
     if (done.sources) aiMsg.sources = done.sources
-    // 回答质量自评卡片（闲聊直答的 done 事件不含该字段，自动不显示）
+    // 回答质量自评卡片 + 真实可信度（闲聊直答的 done 事件不含这些字段，自动不显示）
     if (done.evaluation) aiMsg.evaluation = done.evaluation
+    if (done.confidence) aiMsg.confidence = done.confidence
   } catch (e) {
     const err = e as Error & { error_code?: string; detail?: string }
     aiMsg.status = ''
@@ -370,7 +373,14 @@ onMounted(async () => {
   if (sessionId.value) {
     const detail = await loadSession(sessionId.value)
     if (detail && detail.messages.length) {
-      messages.value = detail.messages.map((m) => ({ role: m.role, content: m.content }))
+      // 历史消息：展开 meta 元信息（sources/evaluation/confidence），老数据 meta 为空时自动降级不展示
+      messages.value = detail.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.role === 'assistant' && m.meta
+          ? { sources: m.meta.sources, evaluation: m.meta.evaluation, confidence: m.meta.confidence }
+          : {}),
+      }))
       if (detail.state === 'QUERY_PENDING' && detail.pending_query) {
         try {
           pending.value = JSON.parse(detail.pending_query) as PendingQuery
@@ -419,7 +429,14 @@ async function onSidebarLoadSession(e: Event) {
   pending.value = null
   const detail2 = await loadSession(sid)
   if (detail2 && detail2.messages.length) {
-    messages.value = detail2.messages.map((m) => ({ role: m.role, content: m.content }))
+    // 历史消息：展开 meta 元信息（sources/evaluation/confidence），老数据 meta 为空时自动降级不展示
+    messages.value = detail2.messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      ...(m.role === 'assistant' && m.meta
+        ? { sources: m.meta.sources, evaluation: m.meta.evaluation, confidence: m.meta.confidence }
+        : {}),
+    }))
     if (detail2.state === 'QUERY_PENDING' && detail2.pending_query) {
       try {
         pending.value = JSON.parse(detail2.pending_query) as PendingQuery
@@ -496,39 +513,50 @@ watch(() => messages.value.length, scrollToBottom)
                   <div class="s-card-body md-body" v-html="renderMd(c.body)" />
                 </details>
               </div>
-              <!-- 回答质量评估卡片（仅工作类回答携带；闲聊无 evaluation 不显示） -->
-              <div v-if="m.evaluation && !m.streaming" class="eval-card">
+              <!-- 回答质量评估卡片（真实检索指标 + LLM 自评；闲聊两者皆无，不显示） -->
+              <div v-if="(m.evaluation || m.confidence) && !m.streaming" class="eval-card">
                 <div class="eval-title">📊 回答质量评估</div>
                 <div class="eval-metrics">
                   <div class="eval-metric">
+                    <span class="eval-label">检索相似度</span>
+                    <span class="eval-value">{{ m.confidence ? m.confidence.score.toFixed(2) : '—' }}</span>
+                  </div>
+                  <div class="eval-metric">
+                    <span class="eval-label">可信度</span>
+                    <span class="eval-value" :class="levelTone(m.confidence?.level || '', true)">
+                      {{ m.confidence?.level || '—' }}
+                    </span>
+                  </div>
+                  <div class="eval-metric">
                     <span class="eval-label">知识库命中度</span>
-                    <span class="eval-value" :class="levelTone(m.evaluation.source_coverage, true)">
-                      {{ m.evaluation.source_coverage || '—' }}
+                    <span class="eval-value" :class="levelTone(m.evaluation?.source_coverage, true)">
+                      {{ m.evaluation?.source_coverage || '—' }}
                     </span>
                   </div>
                   <div class="eval-metric">
                     <span class="eval-label">回答准确度</span>
-                    <span class="eval-value" :class="accuracyTone(m.evaluation.accuracy)">
-                      {{ m.evaluation.accuracy || '—' }}
+                    <span class="eval-value" :class="accuracyTone(m.evaluation?.accuracy || '')">
+                      {{ m.evaluation?.accuracy || '—' }}
                     </span>
                   </div>
                   <div class="eval-metric">
                     <span class="eval-label">幻觉风险</span>
-                    <span class="eval-value" :class="levelTone(m.evaluation.hallucination_risk, false)">
-                      {{ m.evaluation.hallucination_risk || '—' }}
+                    <span class="eval-value" :class="levelTone(m.evaluation?.hallucination_risk || '', false)">
+                      {{ m.evaluation?.hallucination_risk || '—' }}
                     </span>
                   </div>
                 </div>
               </div>
-              <!-- 引用来源：可点击查看原文档 -->
+              <!-- 引用来源：可点击查看原文档（含真实检索相似度） -->
               <div v-if="m.sources && m.sources.length && !m.streaming" class="sources-row">
                 <span class="sources-label">📎 来源文档：</span>
                 <a
                   v-for="s in m.sources"
                   :key="s.doc_id"
                   class="source-link"
+                  :title="s.similarity != null ? `检索相似度 ${s.similarity.toFixed(2)}` : ''"
                   @click="openSource(s)"
-                >📄 {{ s.doc_title }}<span v-if="sourcePageText(s)" class="source-page">（{{ sourcePageText(s) }}）</span></a>
+                >📄 {{ s.doc_title }}<span v-if="sourcePageText(s)" class="source-page">（{{ sourcePageText(s) }}</span><span v-if="s.similarity != null" class="source-page"> · 相似度 {{ s.similarity.toFixed(2) }}</span><span v-if="sourcePageText(s) || s.similarity != null" class="source-page">）</span></a>
               </div>
               <!-- 命中知识库原图回显 -->
               <div

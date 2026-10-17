@@ -122,24 +122,41 @@ def delete_sessions(db: Session, session_ids: list[str], user_id: int) -> int:
 # ----------------------------------------------------------------------
 # messages
 # ----------------------------------------------------------------------
-def add_message(db: Session, session_id: str, role: str, content: str) -> None:
-    """追加消息"""
-    msg = Message(conversation_id=session_id, role=role, content=content)
+def add_message(db: Session, session_id: str, role: str, content: str,
+                meta: dict | None = None) -> None:
+    """追加消息（meta：回答元信息 dict，JSON 序列化落库；None 则不存）"""
+    msg = Message(
+        conversation_id=session_id, role=role, content=content,
+        meta=json.dumps(meta, ensure_ascii=False) if meta else None,
+    )
     db.add(msg)
     db.flush()
 
 
-def get_history(db: Session, session_id: str, limit_turns: int = 8) -> list[dict[str, str]]:
+def get_history(db: Session, session_id: str, limit_turns: int = 8,
+                with_meta: bool = False) -> list[dict]:
     """
     读取最近 limit_turns "轮"消息（1 轮 = user + assistant = 2 条），时间正序。
     limit_turns 是轮数，内部按 turns*2 取条数，保证完整轮次，避免半轮丢上文。
-    返回 [{"role":..., "content":...}, ...]
+    with_meta=False（prompt 注入用）：[{"role","content"}]，省 token；
+    with_meta=True（历史恢复用）：额外带 meta（JSON 已解析为 dict 或 None）。
     """
     msg_limit = max(limit_turns * 2, 2)  # 至少 2 条（1 轮）
     rows = db.query(Message).filter(
         Message.conversation_id == session_id
     ).order_by(Message.id.desc()).limit(msg_limit).all()
-    msgs = [{"role": r.role, "content": r.content} for r in reversed(rows)]
+    msgs: list[dict] = []
+    for r in reversed(rows):
+        item: dict = {"role": r.role, "content": r.content}
+        if with_meta:
+            m = None
+            if r.meta:
+                try:
+                    m = json.loads(r.meta)
+                except (ValueError, TypeError):
+                    m = None  # 脏数据降级为无元信息，不报错
+            item["meta"] = m
+        msgs.append(item)
     # 若最新一条是 user（未配对 assistant），保留它——指代消解需要上一轮 user+assistant
     return msgs
 

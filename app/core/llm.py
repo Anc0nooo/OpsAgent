@@ -42,6 +42,12 @@ def _classify_error(err: Exception) -> str:
         return "forbidden"
     if "404" in msg or "model not found" in low:
         return "model_not_found"
+    if (
+        "maximum context length" in low
+        or "input length" in low and "exceed" in low
+        or ("token" in low and ("exceed" in low or "too long" in low or "limit" in low))
+    ):
+        return "token_limit"
     if "network" in low or "connect" in low or "timeout" in low or "connection" in low:
         return "network"
     return "unknown"

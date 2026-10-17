@@ -114,8 +114,17 @@ PLAN_PROMPT = """你是医院信息科运维工程师的 AI 助手，请基于�
   "need_query": true/false,
   "sql": "仅规则3挂起查询时填单条只读 SELECT/WITH；规则1用户要的 SQL 一律填空串——写进 answer 的 ```sql 代码块",
   "sql_purpose": "挂起查询 SQL 的用途说明（need_query=true 时必填，否则空串）",
-  "answer": "回答正文 markdown：结论/思路 → 步骤 → 完整SQL代码块（用户要 SQL 时）→ 引用来源（有则列文档名；标注了页码的写成「📄《文档名》第X页」）→ 风险提示"
-}}"""
+  "answer": "回答正文 markdown：结论/思路 → 步骤 → 完整SQL代码块（用户要 SQL 时）→ 引用来源（有则列文档名；标注了页码的写成「📄《文档名》第X页」）→ 风险提示",
+  "source_coverage": "知识库命中度：高/中/低",
+  "accuracy": "回答准确度百分比，如 90%",
+  "hallucination_risk": "幻觉风险：低/中/高"
+}}
+
+【回答质量自评规则】（source_coverage / accuracy / hallucination_risk 三项必填）：
+- rag_context 有明确答案且回答完全基于它 → source_coverage="高", accuracy≥90%, hallucination_risk="低"
+- rag_context 有部分答案，回答结合了通用运维经验 → source_coverage="中", accuracy 取 70%~85%, hallucination_risk="中"
+- rag_context 无命中，回答主要靠模型推测 → source_coverage="低", accuracy≤60%, hallucination_risk="高"
+- accuracy 输出百分数字符串（如 "85%"）；自评要诚实，不要虚高；闲聊/寒暄场景三项输出空串"""
 
 # ======================================================================
 # 挂起续推状态说明

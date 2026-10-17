@@ -13,8 +13,8 @@ RAG 知识库 - API 路由（多用户：所有接口需登录，按 user_id 隔
 - GET  /api/knowledge/progress      查询入库/重建进度（前端轮询）
 - POST /api/knowledge/test          检索效果测试（批量问题输出命中与 top-5）
 """
-import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import chromadb
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -32,11 +32,95 @@ from app.db.engine import get_db
 from app.db.models import User
 from app.models.common import fail, ok
 from app.rag import db as rag_db
-from app.rag.service import ALLOWED_TYPES, knowledge_service, set_progress, get_progress
+from app.rag.service import (
+    ALLOWED_TYPES,
+    friendly_error,
+    get_progress,
+    knowledge_service,
+    set_progress,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/knowledge", tags=["RAG知识库"])
+
+# ----------------------------------------------------------------------
+# 后台任务执行器（上传/重建等耗时操作后台跑，接口立即返回，前端轮询 /progress；
+# 大文件不再受前端 HTTP 超时限制）
+# ----------------------------------------------------------------------
+_task_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kb-task")
+
+_PHASE_LABELS = {"queued": "排队", "parsing": "解析", "splitting": "解析分块", "embedding": "向量化"}
+
+
+def _task_progress(uid: int):
+    """后台任务的进度回调：写入模块级进度（供 GET /progress 轮询）"""
+    def _cb(phase, done, total):
+        label = _PHASE_LABELS.get(phase, phase)
+        set_progress(uid, status="processing", phase=phase, done=done, total=total,
+                     detail=f"{label} {done}/{total}")
+    return _cb
+
+
+def _run_ingest_task(uid: int, title: str, filename: str, data: bytes,
+                     doc_type: str, append_doc_id: int | None) -> None:
+    """后台入库任务：自建 DB session（请求级 session 已随请求结束关闭）"""
+    from app.db.engine import SessionLocal
+    db = SessionLocal()
+    try:
+        result = knowledge_service.ingest_file(
+            db, uid, title=title, filename=filename, data=data,
+            doc_type=doc_type, append_doc_id=append_doc_id,
+            progress_cb=_task_progress(uid),
+        )
+        db.commit()
+        detail = f"入库成功：{result['chunks']} 个块"
+        if result.get("failed_chunks"):
+            detail += f"，{result['failed_chunks']} 个块向量化失败（可重建索引补齐）"
+        set_progress(uid, status="done", detail=detail, result=result)
+    except ValueError as e:
+        db.rollback()
+        set_progress(uid, status="error", error=str(e), detail=str(e))
+    except chromadb.errors.InternalError:
+        db.rollback()
+        logger.exception("上传触发 Chroma 索引损坏")
+        try:
+            knowledge_service.repair_index(db, uid)
+            db.commit()
+        except Exception as repair_err:  # noqa: BLE001
+            logger.exception("Chroma 自动修复失败")
+            set_progress(
+                uid, status="error",
+                error=f"知识库索引损坏且自动修复失败（{repair_err}），请停止后端后将 data/chroma 目录改名留底再重启",
+            )
+            return
+        set_progress(uid, status="error", error="知识库索引损坏，已自动修复，请重新上传")
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        logger.exception("上传入库失败 %s", filename)
+        msg = friendly_error(e)
+        set_progress(uid, status="error", error=msg, detail=f"入库失败: {msg}")
+    finally:
+        db.close()
+
+
+def _run_reindex_task(uid: int) -> None:
+    """后台重建索引任务：自建 DB session"""
+    from app.db.engine import SessionLocal
+    db = SessionLocal()
+    try:
+        result = knowledge_service.rebuild_index(db, uid, progress_cb=_task_progress(uid))
+        db.commit()
+        set_progress(uid, status="done",
+                     detail=f"重建完成：{result['docs']} 篇文档，{result['chunks']} 个块",
+                     result=result)
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        logger.exception("重建索引失败")
+        msg = friendly_error(e)
+        set_progress(uid, status="error", error=msg, detail=f"重建索引失败: {msg}")
+    finally:
+        db.close()
 
 
 # ----------------------------------------------------------------------
@@ -116,62 +200,24 @@ async def upload_doc(
 ) -> dict:
     """上传文档入库（txt/md/sql/pdf/docx），支持增量追加。
 
-    PDF/Word 走结构化解析：表格转 Markdown、内嵌图片提取落盘 + qwen-vl OCR、
-    页眉页脚/页码写入块元数据；txt/md/sql 走纯文本解析。
+    提交后立即返回，实际解析/切分/向量化在后台任务执行（大文件不受 HTTP 超时限制），
+    前端轮询 GET /progress 获取进度与最终结果（result.doc_id / error）。
     """
     if doc_type not in ALLOWED_TYPES:
         return fail(400, f"不支持的文档类型: {doc_type}，可选: {ALLOWED_TYPES}")
+    if get_progress(user.id).get("status") == "processing":
+        return fail(429, "已有入库/重建任务在处理中，请等待完成后再提交")
     data = await file.read()
+    final_title = title or file.filename or "未命名文档"
     uid = user.id
-    # 进度回调（供 GET /progress 轮询）
-    def _progress(phase, done, total):
-        label = "向量化" if phase == "embedding" else "解析分块"
-        set_progress(uid, status="processing", phase=phase,
-                     done=done, total=total,
-                     detail=f"{label} {done}/{total}")
-    set_progress(uid, status="processing", phase="parsing",
-                 done=0, total=0, detail="解析文档中…")
-    try:
-        loop = asyncio.get_event_loop()
-        doc_id: int | None = await loop.run_in_executor(
-            None,
-            lambda: knowledge_service.ingest_file(
-                db, uid,
-                title=title or file.filename or "未命名文档",
-                filename=file.filename or "",
-                data=data,
-                doc_type=doc_type,
-                append_doc_id=append_doc_id,
-                progress_cb=_progress,
-            ),
-        )
-        db.commit()
-        log_operation(db, uid, "upload_doc",
-                      f"上传文档《{title or file.filename}》(id={doc_id})",
-                      request, username=user.username)
-        set_progress(uid, status="done", detail="入库成功")
-        return ok({"doc_id": doc_id, "message": "入库成功"})
-    except ValueError as e:
-        set_progress(uid, status="error", detail=str(e))
-        return fail(400, str(e))
-    except chromadb.errors.InternalError:
-        # Chroma HNSW 索引损坏：本次写入已回滚，自动修复后提示重新上传
-        logger.exception("上传触发 Chroma 索引损坏")
-        try:
-            knowledge_service.repair_index(db, uid)
-            db.commit()
-        except Exception as repair_err:  # noqa: BLE001
-            logger.exception("Chroma 自动修复失败")
-            return fail(
-                500,
-                f"知识库索引损坏且自动修复失败（{repair_err}），"
-                "请停止后端后将 data/chroma 目录改名留底再重启",
-            )
-        return fail(500, "知识库索引损坏，已自动修复，请重新上传")
-    except Exception as e:  # noqa: BLE001
-        logger.exception("上传入库失败")
-        set_progress(uid, status="error", detail=f"入库失败: {e}")
-        return fail(500, f"入库失败: {e}")
+    set_progress(uid, status="processing", phase="queued", done=0, total=0,
+                 detail="任务已提交，排队处理中…", result=None, error=None)
+    _task_executor.submit(_run_ingest_task, uid, final_title,
+                          file.filename or "", data, doc_type, append_doc_id)
+    log_operation(db, uid, "upload_doc",
+                  f"提交上传文档《{final_title}》", request, username=user.username)
+    db.commit()
+    return ok({"task": "accepted", "message": "已提交后台处理，请关注进度条"})
 
 
 @router.post("/text")
@@ -458,31 +504,17 @@ def search(body: SearchIn, request: Request, db: Session = Depends(get_db),
 @router.post("/reindex")
 async def reindex(db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)) -> dict:
-    """重建索引：按当前分块策略对当前用户全部文档重新切分 + 重新向量化（耗时操作）。"""
+    """重建索引：按当前分块策略对当前用户全部文档重新切分 + 重新向量化（耗时操作）。
+
+    提交后立即返回，后台任务执行，前端轮询 GET /progress 获取进度与结果。
+    """
     uid = user.id
-    def _progress(phase, done, total):
-        label = "向量化" if phase == "embedding" else "解析分块"
-        set_progress(uid, status="processing", phase=phase,
-                     done=done, total=total,
-                     detail=f"{label} {done}/{total}")
-    set_progress(uid, status="processing", phase="splitting",
-                 done=0, total=0, detail="重建索引中…")
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: knowledge_service.rebuild_index(db, uid, progress_cb=_progress))
-        db.commit()
-        set_progress(uid, status="done", detail=f"重建完成：{result['docs']} 篇文档，{result['chunks']} 个块")
-        return ok({
-            "docs": result["docs"],
-            "chunks": result["chunks"],
-            "detail": result["detail"],
-            "message": f"重建完成：{result['docs']} 篇文档，{result['chunks']} 个块",
-        })
-    except Exception as e:  # noqa: BLE001
-        logger.exception("重建索引失败")
-        set_progress(uid, status="error", detail=f"重建索引失败: {e}")
-        return fail(500, f"重建索引失败: {e}")
+    if get_progress(uid).get("status") == "processing":
+        return fail(429, "已有入库/重建任务在处理中，请等待完成后再提交")
+    set_progress(uid, status="processing", phase="queued", done=0, total=0,
+                 detail="重建任务已提交，排队处理中…", result=None, error=None)
+    _task_executor.submit(_run_reindex_task, uid)
+    return ok({"task": "accepted", "message": "重建任务已提交，请关注进度条"})
 
 
 @router.get("/progress")

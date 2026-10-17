@@ -27,6 +27,16 @@ export interface ChatEvent {
   sources?: SourceRef[]
   /** done 事件附加：回答质量自评（仅工作类问题产出；闲聊无此字段） */
   evaluation?: AnswerEvaluation
+  /** done 事件附加：真实可信度（来自检索相似度分数分层，非模型自报；仅工作类产出） */
+  confidence?: ConfidenceInfo
+}
+
+/** 真实可信度：检索最高相似度分数 + 分层（高/中/低） */
+export interface ConfidenceInfo {
+  /** 全部来源中的最高相似度（0~1，混合检索融合分） */
+  score: number
+  /** 分层：高（≥0.75）/ 中（≥0.45）/ 低 */
+  level: string
 }
 
 /** 回答质量评估（LLM 自评，随工作类回答的 done 事件返回） */
@@ -43,6 +53,8 @@ export interface AnswerEvaluation {
 export interface SourceRef {
   doc_id: number
   doc_title: string
+  /** 该文档命中的最高相似度（0~1，混合检索融合分） */
+  similarity?: number
   /** 命中页码列表（纯文本文档为空数组） */
   pages?: number[]
   /** 命中块内原图 */
@@ -69,6 +81,13 @@ export interface PendingQuery {
   round: number
 }
 
+/** 消息元信息（assistant 回答落库的 sources/evaluation/confidence；老数据为 null，前端降级不展示） */
+export interface MessageMeta {
+  sources?: SourceRef[]
+  evaluation?: AnswerEvaluation
+  confidence?: ConfidenceInfo
+}
+
 /** 会话详情（历史恢复用） */
 export interface SessionDetail {
   id: string
@@ -76,7 +95,7 @@ export interface SessionDetail {
   state: string
   pending_query: string | null
   query_round: number
-  messages: { role: 'user' | 'assistant'; content: string }[]
+  messages: { role: 'user' | 'assistant'; content: string; meta?: MessageMeta | null }[]
 }
 
 const http = createAuthHttp({ baseURL: '/api', timeout: 30000 })

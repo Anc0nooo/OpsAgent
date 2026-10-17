@@ -154,6 +154,9 @@ class Message(Base):
                               nullable=False)
     role = Column(String(20), nullable=False)  # user/assistant/system
     content = Column(Text, nullable=False)
+    # 消息元信息（JSON 字符串）：assistant 回答附带 sources/evaluation/confidence，
+    # 供历史会话恢复时重渲染来源/图片/相似度/可信度/幻觉风险；user 消息与老数据为 NULL
+    meta = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=sa_text("CURRENT_TIMESTAMP"))
 
     __table_args__ = (

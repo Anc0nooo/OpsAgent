@@ -63,7 +63,7 @@ def session_detail(session_id: str, db: Session = Depends(get_db),
     session = store.get_session(db, session_id, user.id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"会话不存在或无权访问: {session_id}")
-    session["messages"] = store.get_history(db, session_id, limit_turns=200)
+    session["messages"] = store.get_history(db, session_id, limit_turns=200, with_meta=True)
     return ok(session)
 
 

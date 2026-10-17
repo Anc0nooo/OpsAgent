@@ -144,6 +144,22 @@ def _evaluation(result: dict) -> dict | None:
     return {"source_coverage": cov, "accuracy": acc, "hallucination_risk": risk}
 
 
+def _confidence(rag_sources: list[dict] | None) -> dict:
+    """
+    真实可信度（来自检索链路的相似度分数，非模型自报）：
+    取全部来源中的最高相似度（0~1），映射为 高/中/低 分层。
+    阈值：≥0.75 高（命中充分）；≥0.45 中（部分命中）；其余 低（弱命中/未命中）。
+    """
+    top = 0.0
+    for s in rag_sources or []:
+        try:
+            top = max(top, float(s.get("similarity") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    level = "高" if top >= 0.75 else ("中" if top >= 0.45 else "低")
+    return {"score": round(top, 2), "level": level}
+
+
 class Planner:
     """规划器（无状态编排，会话状态存 MySQL，按 user_id 隔离）"""
 
@@ -176,7 +192,8 @@ class Planner:
         else:
             reply = self._new_question(db, user, sid, text, history_text)
 
-        store.add_message(db, sid, "assistant", reply["content"])
+        store.add_message(db, sid, "assistant", reply["content"],
+                          meta={"evaluation": reply["evaluation"]} if reply.get("evaluation") else None)
         db.commit()
         return reply
 
@@ -440,11 +457,15 @@ class Planner:
             store.update_session(db, sid, user_id, state=AgentState.QUERY_PENDING.value,
                                  pending_query=pending, query_round=new_round)
             yield {"type": "delta", "content": content}
-            store.add_message(db, sid, "assistant", content)
+            # 元信息随回答落库（历史恢复时重渲染来源/相似度/可信度/幻觉风险）
+            store.add_message(db, sid, "assistant", content, meta={
+                "sources": rag_sources, "evaluation": evaluation,
+                "confidence": _confidence(rag_sources),
+            })
             db.commit()
             yield {"type": "done", "session_id": sid, "state": AgentState.QUERY_PENDING.value,
                    "need_query": True, "query_round": new_round, "pending_query": pending,
-                   "sources": rag_sources, "evaluation": evaluation}
+                   "sources": rag_sources, "evaluation": evaluation, "confidence": _confidence(rag_sources)}
             return
 
         # ④ 正文：切片模拟流式打字机（单次 structured 已生成 answer，前端逐块呈现）
@@ -457,13 +478,18 @@ class Planner:
         # 结果输出：方案末尾附加引用来源 + 四段总结结构（供前端卡片与导出）
         content = attach_sources(content, rag_sources)
         sections = build_summary_sections(content)
-        store.add_message(db, sid, "assistant", content)
+        # 元信息随回答落库（历史恢复时重渲染来源/图片/相似度/可信度/幻觉风险）
+        store.add_message(db, sid, "assistant", content, meta={
+            "sources": rag_sources, "evaluation": evaluation,
+            "confidence": _confidence(rag_sources),
+        })
         store.update_session(db, sid, user_id, state=AgentState.DONE.value, clear_pending=True,
                              query_round=session["query_round"] or 0)
         db.commit()
         yield {"type": "done", "session_id": sid, "state": AgentState.DONE.value,
                "need_query": False, "query_round": session["query_round"] or 0,
-               "sections": sections, "sources": rag_sources, "evaluation": evaluation}
+               "sections": sections, "sources": rag_sources, "evaluation": evaluation,
+               "confidence": _confidence(rag_sources)}
 
     # ------------------------------------------------------------------
     # 内部工具

@@ -15,6 +15,7 @@ import json
 import logging
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ import chromadb
 from sqlalchemy.orm import Session
 
 from app.config.settings import settings
-from app.core.llm import get_user_llm
+from app.core.llm import LLMApiError, get_user_llm
 from app.rag import db as rag_db
 from app.rag.bm25 import BM25Index
 from app.rag.document_loader import parse_file
@@ -30,6 +31,32 @@ from app.rag.splitter import split_document, split_structured
 from app.rag.table_parser import parse_table_schema
 
 logger = logging.getLogger(__name__)
+
+
+def friendly_error(e: Exception) -> str:
+    """把底层异常翻译成用户可读的错误信息（禁止笼统的"切块失败"）"""
+    if isinstance(e, LLMApiError):
+        code = getattr(e, "error_code", "unknown")
+        msgs = {
+            "invalid_key": "API Key 无效或未配置，请在「设置」中检查模型 API Key",
+            "quota_exceeded": "模型接口限流或配额不足（429），请稍后重试或检查 API 配额",
+            "forbidden": "模型接口拒绝访问（403），请检查 API Key 权限",
+            "model_not_found": "模型不存在或无权访问，请检查模型名称配置",
+            "token_limit": "文本超出模型 token 上限，请尝试调小单块大小后重建索引",
+            "network": "网络超时或连接失败，请检查网络与 API 服务可用性后重试",
+        }
+        return msgs.get(code, f"模型接口调用失败: {e}")
+    msg = str(e)
+    low = msg.lower()
+    if isinstance(e, MemoryError):
+        return "服务器内存不足，请尝试拆分后分批上传"
+    if "maximum context length" in low or ("token" in low and "exceed" in low):
+        return "文本超出 embedding 模型 token 上限，请尝试调小单块大小后重建索引"
+    if "pymupdf" in low or "pdf" in low and ("parse" in low or "damaged" in low or "corrupt" in low):
+        return f"PDF 解析失败（文件可能损坏或加密）: {msg[:200]}"
+    if isinstance(e, ValueError):
+        return msg
+    return f"{type(e).__name__}: {msg[:300]}"
 
 # 文档类型常量（5 类，存 code，前端显示中文映射）
 TYPE_GUIDE = "guide"       # 操作指导类（模式B：用户可调 chunk_size）
@@ -175,7 +202,7 @@ class KnowledgeService:
         self._get_bm25(db, user_id, rebuild=True)
 
     def _reembed_all(self, db: Session, user_id: int) -> None:
-        """修复后从 MySQL 全量块重新向量化写入当前用户 collection（分批 embed + upsert）"""
+        """修复后从 MySQL 全量块重新向量化写入当前用户 collection（并发 embed + upsert）"""
         chunks = rag_db.all_chunks(db, user_id)
         if not chunks:
             logger.info("用户 %s Chroma 重建完成：无知识块，无需回填", user_id)
@@ -189,29 +216,23 @@ class KnowledgeService:
             return
         col = self._get_collection(user_id)
         doc_map = {d["id"]: d["title"] for d in rag_db.list_docs(db, user_id)}
-        size = settings.EMBED_BATCH_SIZE
-        total = len(chunks)
-        done = 0
-        for i in range(0, total, size):
-            batch = chunks[i:i + size]
-            b_texts = [c["text"] for c in batch]
-            b_ids = [c["id"] for c in batch]
-            b_metas = [
+        failed = self._embed_and_upsert(
+            client, col,
+            [c["id"] for c in chunks],
+            [c["text"] for c in chunks],
+            [
                 {
                     "doc_id": c["doc_id"],
                     "doc_title": doc_map.get(c["doc_id"], ""),
                     "section": c.get("section", ""),
                     "doc_type": c["doc_type"],
                 }
-                for c in batch
-            ]
-            vecs = self._embed_one_batch(get_user_llm(db, user_id), b_texts)
-            v_ids, v_texts, v_vecs, v_metas = self._filter_valid(b_ids, b_texts, vecs, b_metas)
-            if v_ids:
-                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
-            done += len(batch)
-            logger.info("用户 %s Chroma 向量回填进度: %d/%d", user_id, done, total)
-        logger.info("用户 %s Chroma 重建完成，共回填 %d 个向量", user_id, total)
+                for c in chunks
+            ],
+        )
+        if failed:
+            logger.warning("用户 %s Chroma 回填完成，%d 块向量化失败（详见 failed 明细）", user_id, len(failed))
+        logger.info("用户 %s Chroma 重建完成，共回填 %d 个向量", user_id, len(chunks) - len(failed))
 
     def _get_bm25(self, db: Session, user_id: int, rebuild: bool = False) -> BM25Index:
         """获取当前用户的 BM25 索引（首次访问或 rebuild 时从 MySQL 全量构建）"""
@@ -260,31 +281,74 @@ class KnowledgeService:
                 vecs.append(None)
         return vecs
 
-    def _embed_chunks(
-        self, db: Session, user_id: int, texts: list[str],
+    def _embed_and_upsert(
+        self, client, col, ids: list[str], texts: list[str], metadatas: list[dict],
         progress_cb=None,
-    ) -> list[list[float] | None]:
-        """批量向量化文档分块：逐批处理，失败的 chunk 返回 None（不中断入库）。
+    ) -> list[dict]:
+        """并发分批向量化 + 每批成功即 upsert Chroma（断点续传语义：成功批不重做）。
 
-        - 按 EMBED_BATCH_SIZE(16) 分批，一次请求传整批
-        - 单批失败：重试一次 → 逐条降级 → 标记 None
-        - 进度回调 progress_cb(phase, done, total)，phase="embedding"，每批调用一次
+        - 按 EMBED_BATCH_SIZE 分批，EMBED_CONCURRENCY 批并发调用
+          （单批内部仍带指数退避重试与逐条降级，见 _embed_one_batch）
+        - 每批向量完成后立刻 upsert：后续批次失败/任务中断时，已完成的批次不会重复处理
+        - 仍失败的块计入返回的 failed 明细（不中断整体入库）
+        - 进度回调 progress_cb(phase, done, total)：done 按累计完成批大小递增（单调）
+        返回: [{"id", "error"}] 失败块明细（空列表 = 全部成功）。
         """
         if not texts:
             return []
-        client = get_user_llm(db, user_id)
-        bs = settings.EMBED_BATCH_SIZE
-        result: list[list[float] | None] = [None] * len(texts)
+        bs = max(1, settings.EMBED_BATCH_SIZE)
+        jobs = [
+            (ids[i:i + bs], texts[i:i + bs], metadatas[i:i + bs])
+            for i in range(0, len(texts), bs)
+        ]
+
+        def work(job):
+            b_ids, b_texts, b_metas = job
+            vecs = self._embed_one_batch(client, b_texts)
+            valid = self._filter_valid(b_ids, b_texts, vecs, b_metas)
+            return job, valid
+
+        failed: list[dict] = []
         done = 0
-        for i in range(0, len(texts), bs):
-            batch = texts[i:i + bs]
-            vecs = self._embed_one_batch(client, batch)
-            for j, v in enumerate(vecs):
-                result[i + j] = v
-            done += len(batch)
-            if progress_cb:
-                progress_cb("embedding", done, len(texts))
-        return result
+        ok_total = 0
+        conc = max(1, min(settings.EMBED_CONCURRENCY, len(jobs)))
+        with ThreadPoolExecutor(max_workers=conc, thread_name_prefix="embed") as ex:
+            futs = {ex.submit(work, j): j for j in jobs}
+            for fut in as_completed(futs):
+                job = futs[fut]
+                b_ids, _b_texts, _b_metas = job
+                done += len(b_ids)
+                try:
+                    _, valid = fut.result()
+                except Exception as e:  # noqa: BLE001  理论上 _embed_one_batch 不抛，兜底
+                    logger.error("embedding 批任务异常（%d 块）: %s", len(b_ids), e)
+                    failed.extend({"id": cid, "error": friendly_error(e)} for cid in b_ids)
+                    if progress_cb:
+                        progress_cb("embedding", done, len(texts))
+                    continue
+                v_ids, v_texts, v_vecs, v_metas = valid
+                if v_ids:
+                    try:
+                        col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
+                        ok_total += len(v_ids)
+                    except chromadb.errors.InternalError:
+                        # HNSW 索引损坏：上抛由调用方触发自动修复（保留既有语义）
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        logger.error("Chroma upsert 失败（%d 块）: %s", len(v_ids), e)
+                        failed.extend(
+                            {"id": cid, "error": f"写入向量库失败: {friendly_error(e)}"} for cid in v_ids)
+                v_set = set(v_ids)
+                for cid in b_ids:
+                    if cid not in v_set:
+                        failed.append({"id": cid, "error": "向量化失败（已重试与逐条降级），可稍后重建索引补齐"})
+                if progress_cb:
+                    progress_cb("embedding", done, len(texts))
+        logger.info(
+            "向量化完成 user 批次=%d 块=%d 成功=%d 失败=%d（并发=%d 批大小=%d）",
+            len(jobs), len(texts), ok_total, len(failed), conc, bs,
+        )
+        return failed
 
     @staticmethod
     def _filter_valid(
@@ -390,8 +454,13 @@ class KnowledgeService:
 
     def ingest_file(self, db: Session, user_id: int, title: str, filename: str,
                     data: bytes, doc_type: str, append_doc_id: int | None = None,
-                    progress_cb=None) -> int:
-        """上传文件入库主流程：结构化解析（图/OCR/位置）→ 双模式切分 → MySQL + Chroma + BM25"""
+                    progress_cb=None) -> dict:
+        """上传文件入库主流程：结构化解析（图/OCR/位置）→ 双模式切分 → MySQL + Chroma + BM25
+
+        返回: {"doc_id", "chunks", "failed_chunks", "failed_sample", "failed_detail"}
+        - failed_chunks > 0 表示部分块向量化失败（已重试与降级），主流程不算失败，
+          块已入 MySQL 但无向量，可通过"重建索引"补齐；failed_detail 供前端展示原因。
+        """
         # 增量追加：解析为纯文本走既有 append 流程（不做图片/OCR）
         if append_doc_id is not None:
             if filename.lower().endswith(".docx"):
@@ -400,10 +469,12 @@ class KnowledgeService:
             else:
                 from app.rag.api import read_file_text
                 text = read_file_text(filename, data)
-            return self.add_document(
+            did = self.add_document(
                 db, user_id, title=title, text=text, doc_type=doc_type,
                 source=f"upload:{filename}", doc_id=append_doc_id, append=True,
             )
+            return {"doc_id": did, "chunks": 0, "failed_chunks": 0,
+                    "failed_sample": [], "failed_detail": []}
 
         # 1. 先建文档行（图片目录/引用需要 doc_id）
         doc_id = rag_db.insert_doc(db, user_id, title=title, doc_type=doc_type,
@@ -412,8 +483,21 @@ class KnowledgeService:
         try:
             # 2. 结构化解析（txt/md 同样产出 ParsedDocument，统一走双模式切分）
             ocr_fn = self._get_ocr_fn(db, user_id)
-            parsed = parse_file(data, filename, user_id, doc_id, ocr_fn)
-            chunks = self._split_parsed(db, user_id, parsed, doc_type)
+
+            def parse_progress(done, total):
+                if progress_cb:
+                    progress_cb("parsing", done, total)
+
+            try:
+                parsed = parse_file(data, filename, user_id, doc_id, ocr_fn,
+                                    progress_fn=parse_progress)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"文件解析失败: {friendly_error(e)}") from e
+
+            try:
+                chunks = self._split_parsed(db, user_id, parsed, doc_type)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"文档切分失败: {e}") from e
             if not chunks:
                 raise ValueError("文档内容为空，无法入库")
             # 排查日志：文档类型 → 切分模式（A 语义 / B 用户参数）→ 块数
@@ -435,20 +519,25 @@ class KnowledgeService:
                         im["id"] = key_to_id[im["key"]]
                     im.pop("key", None)
 
-            # 4. 块入库 + 向量化
+            # 4. 块入库 + 并发向量化（每批成功即写 Chroma；失败块计入明细，不中断入库）
             col = self._get_collection(user_id)
             ids = rag_db.insert_chunks(db, doc_id, doc_type, chunks, start_seq=0)
             rag_db.update_doc_meta(db, doc_id, user_id, chunk_count=len(ids))
             texts = [c["text"] for c in chunks]
-            vectors = self._embed_chunks(db, user_id, texts, progress_cb=progress_cb)
             metadatas = [
                 {"doc_id": doc_id, "doc_title": title,
                  "section": c.get("section", ""), "doc_type": doc_type}
                 for c in chunks
             ]
-            v_ids, v_texts, v_vecs, v_metas = self._filter_valid(ids, texts, vectors, metadatas)
-            if v_ids:
-                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
+            client = get_user_llm(db, user_id)
+            if not client.configured:
+                failed: list[dict] = [
+                    {"id": cid, "error": "未配置 API Key，仅完成文本入库（BM25 可检索，向量待补）"}
+                    for cid in ids
+                ]
+            else:
+                failed = self._embed_and_upsert(client, col, ids, texts, metadatas,
+                                                progress_cb=progress_cb)
 
             # 5. BM25 同步 + 解析缓存（供重建复用，OCR 不重跑）
             bm25 = self._get_bm25(db, user_id)
@@ -456,9 +545,14 @@ class KnowledgeService:
                 bm25.add(cid, t)
             self._write_parsed_cache(doc_id, parsed)
 
-            logger.info("文件入库完成 user=%s doc_id=%s title=%s 块=%s 图=%s",
-                        user_id, doc_id, title, len(ids), len(parsed.image_files))
-            return doc_id
+            logger.info("文件入库完成 user=%s doc_id=%s title=%s 块=%s 图=%s 向量失败=%s",
+                        user_id, doc_id, title, len(ids), len(parsed.image_files), len(failed))
+            return {
+                "doc_id": doc_id, "chunks": len(ids),
+                "failed_chunks": len(failed),
+                "failed_sample": [f["error"] for f in failed[:3]],
+                "failed_detail": failed[:20],
+            }
         except chromadb.errors.InternalError:
             rag_db.delete_chunks_by_doc(db, doc_id)
             rag_db.delete_images_by_doc(db, doc_id)
@@ -517,17 +611,21 @@ class KnowledgeService:
         ids = rag_db.insert_chunks(db, doc_id, doc_type, chunks, start_seq=start_seq)
         rag_db.update_doc_meta(db, doc_id, user_id, chunk_count=start_seq + len(ids))
 
-        # 4. Chroma 写向量（索引损坏 InternalError：回滚本次 MySQL 写入后抛出，由上层统一修复）
+        # 4. Chroma 写向量（并发分批向量化+upsert；索引损坏 InternalError：回滚本次 MySQL 写入后抛出，由上层统一修复）
         texts = [c["text"] for c in chunks]
-        vectors = self._embed_chunks(db, user_id, texts)
         metadatas = [
             {"doc_id": doc_id, "doc_title": title, "section": c.get("section", ""), "doc_type": doc_type}
             for c in chunks
         ]
-        v_ids, v_texts, v_vecs, v_metas = self._filter_valid(ids, texts, vectors, metadatas)
+        client = get_user_llm(db, user_id)
         try:
-            if v_ids:
-                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
+            if client.configured:
+                failed = self._embed_and_upsert(client, col, ids, texts, metadatas)
+            else:
+                failed = [
+                    {"id": cid, "error": "未配置 API Key，仅完成文本入库（BM25 可检索，向量待补）"}
+                    for cid in ids
+                ]
         except chromadb.errors.InternalError:
             if append:
                 rag_db.delete_chunks_by_ids(db, ids)
@@ -536,6 +634,9 @@ class KnowledgeService:
                 rag_db.delete_chunks_by_doc(db, doc_id)
                 rag_db.delete_doc(db, doc_id, user_id)
             raise
+        if failed:
+            logger.warning("文档《%s》%d/%d 块向量化失败: %s",
+                           title, len(failed), len(ids), failed[0]["error"])
 
         # 5. BM25 索引同步
         bm25 = self._get_bm25(db, user_id)
@@ -636,14 +737,18 @@ class KnowledgeService:
         # 2. 写新：块记录 + 向量 + BM25
         ids = rag_db.insert_chunks(db, doc_id, doc_type, chunks, start_seq=0)
         texts = [c["text"] for c in chunks]
-        vectors = self._embed_chunks(db, user_id, texts)
         metadatas = [
             {"doc_id": doc_id, "doc_title": title, "section": c.get("section", ""), "doc_type": doc_type}
             for c in chunks
         ]
-        v_ids, v_texts, v_vecs, v_metas = self._filter_valid(ids, texts, vectors, metadatas)
-        if v_ids:
-            col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
+        client = get_user_llm(db, user_id)
+        if client.configured:
+            failed = self._embed_and_upsert(client, col, ids, texts, metadatas)
+        else:
+            failed = [{"id": cid, "error": "未配置 API Key，仅完成文本入库"} for cid in ids]
+        if failed:
+            logger.warning("文档编辑保存《%s》%d/%d 块向量化失败: %s",
+                           title, len(failed), len(ids), failed[0]["error"])
         for cid, t in zip(ids, texts):
             bm25.add(cid, t)
 
@@ -962,22 +1067,20 @@ class KnowledgeService:
                 ],
             })
 
-        # ---- 阶段2：批量向量化（总块数已知，done 跨文档累加、单调递增）----
+        # ---- 阶段2：并发向量化（总块数已知，done 跨文档单调累加、不回跳）----
+        client = get_user_llm(db, user_id)
         embed_total = sum(len(p["texts"]) for p in pending)
-        done_base = 0
-        for p in pending:
-            if not p["texts"]:
-                continue
-            cb = None
-            if progress_cb:
-                def cb(done, _t, _base=done_base):  # noqa: E306
-                    progress_cb("embedding", _base + done, embed_total)
-            vectors = self._embed_chunks(db, user_id, p["texts"], progress_cb=cb)
-            v_ids, v_texts, v_vecs, v_metas = self._filter_valid(
-                p["ids"], p["texts"], vectors, p["metadatas"])
-            if v_ids:
-                col.upsert(ids=v_ids, documents=v_texts, embeddings=v_vecs, metadatas=v_metas)
-            done_base += len(p["texts"])
+        if embed_total and client.configured:
+            all_ids = [cid for p in pending for cid in p["ids"]]
+            all_texts = [t for p in pending for t in p["texts"]]
+            all_metas = [m for p in pending for m in p["metadatas"]]
+            failed = self._embed_and_upsert(client, col, all_ids, all_texts, all_metas,
+                                            progress_cb=progress_cb)
+            if failed:
+                logger.warning("用户 %s 重建索引：%d/%d 块向量化失败（可再次重建补齐）: %s",
+                               user_id, len(failed), embed_total, failed[0]["error"])
+        elif embed_total:
+            logger.warning("用户 %s 未配置 API Key，重建索引仅完成文本重切（向量待补）", user_id)
 
         # 2. 重建 BM25
         self._bm25_map.pop(user_id, None)
